@@ -36,6 +36,32 @@ from ..utils import (
 )
 from ..utils.traversal import find_element, require, traverse_obj
 
+from .tiktok_utils.douyin.api import (
+    AWEME_DETAIL_API_URL,
+    build_aweme_detail_query,
+    sign_aweme_detail_query,
+)
+from .tiktok_utils.douyin.constants import (
+    DOUYIN_DEFAULT_WEB_HEADERS,
+    DOUYIN_USER_AGENT,
+)
+from .tiktok_utils.douyin.cookies import (
+    build_douyin_cookie_header,
+    ensure_douyin_cookies,
+)
+from .tiktok_utils.douyin.render_data import (
+    extract_render_data_json,
+    extract_video_detail,
+    make_jingxuan_url,
+)
+from .tiktok_utils.formats import (
+    build_bytedance_addr_meta,
+    build_douyin_web_bitrate_meta,
+    build_tiktok_bitrate_meta,
+    get_bytedance_addr_url_key,
+    normalize_bytedance_vcodec,
+    parse_bytedance_url_key,
+)
 
 class TikTokBaseIE(InfoExtractor):
     _UPLOADER_URL_FORMAT = 'https://www.tiktok.com/@%s'
@@ -386,17 +412,13 @@ class TikTokBaseIE(InfoExtractor):
         return subtitles
 
     def _parse_url_key(self, url_key):
-        format_id, codec, res, bitrate = self._search_regex(
-            r'v[^_]+_(?P<id>(?P<codec>[^_]+)_(?P<res>\d+p)_(?P<bitrate>\d+))', url_key,
-            'url key', default=(None, None, None, None), group=('id', 'codec', 'res', 'bitrate'))
-        if not format_id:
-            return {}, None
-        return {
-            'format_id': format_id,
-            'vcodec': 'h265' if codec == 'bytevc1' else codec,
-            'tbr': int_or_none(bitrate, scale=1000) or None,
-            'quality': qualities(self.QUALITIES)(res),
-        }, res
+        """
+        Parse TikTok / Douyin UrlKey.
+
+        The actual implementation lives in tiktok/formats.py so that TikTok,
+        Douyin API and Douyin webpage extraction can share the same parser.
+        """
+        return parse_bytedance_url_key(url_key)
 
     def _parse_aweme_video_app(self, aweme_detail):
         aweme_id = aweme_detail['aweme_id']
@@ -560,76 +582,201 @@ class TikTokBaseIE(InfoExtractor):
         }
 
     def _extract_web_formats(self, aweme_detail):
+        """
+        解析 TikTok Web 页面 hydration 数据中的 formats。
+
+        当前 Web 链路主要来源：
+        1. video.bitrateInfo[].PlayAddr.UrlList
+           - 最完整、最准确的多档格式来源
+           - 每一档有自己的 Width / Height / DataSize / Bitrate / CodecType / FPS
+
+        2. video.playAddr
+           - 顶层播放地址
+           - 宽高通常对应 video.width / video.height
+           - 如果存在 PlayAddrStruct，则优先用 PlayAddrStruct 补充 metadata
+           - 如果 PlayAddrStruct.UrlKey 能匹配 bitrateInfo[].PlayAddr.UrlKey，则复用 bitrateInfo 的完整 metadata
+
+        3. video.downloadAddr / video.download.url
+           - 下载地址，通常可能带水印
+           - 如果存在 DownloadAddrStruct，则优先用 DownloadAddrStruct
+           - 否则只能用 video 顶层字段弱兜底
+
+        4. music.playUrl
+           - slideshow 音频兜底
+        """
         COMMON_FORMAT_INFO = {
             'ext': 'mp4',
             'vcodec': 'h264',
             'acodec': 'aac',
         }
+
         video_info = traverse_obj(aweme_detail, ('video', {dict})) or {}
+
+        # 顶层 width / height 主要代表顶层 playAddr，不应该覆盖 bitrateInfo 多档
         play_width = int_or_none(video_info.get('width'))
         play_height = int_or_none(video_info.get('height'))
         ratio = try_call(lambda: play_width / play_height) or 0.5625
+
         formats = []
 
+        # 用于让顶层 playAddr 通过 PlayAddrStruct.UrlKey 反查 bitrateInfo 的完整 metadata
+        bitrate_meta_by_url_key = {}
+
+        # 用于让顶层 playAddr 通过 URL 反查 bitrateInfo 的完整 metadata
+        # 某些情况下 PlayAddrStruct.UrlKey 缺失，但 URL 与 bitrateInfo URL 一致。
+        bitrate_meta_by_url = {}
+
+        # 1. 优先加入 bitrateInfo formats
+        # 这部分 metadata 通常最完整，所以放在 play/download 前面。
+        # _remove_duplicate_formats 只按 URL 去重，不合并 metadata；
+        # 因此更完整的 bitrateInfo 必须先 append。
         for bitrate_info in traverse_obj(video_info, ('bitrateInfo', lambda _, v: v['PlayAddr']['UrlList'])):
-            format_info, res = self._parse_url_key(
-                traverse_obj(bitrate_info, ('PlayAddr', 'UrlKey', {str})) or '')
-            # bytevc2 is bytedance's own custom h266/vvc codec, as-of-yet unplayable
+            play_addr = traverse_obj(bitrate_info, ('PlayAddr', {dict})) or {}
+
+            format_info = build_tiktok_bitrate_meta(bitrate_info, ratio=ratio, parse_json_func=self._parse_json)
+
             is_bytevc2 = format_info.get('vcodec') == 'bytevc2'
-            format_info.update({
-                'format_note': 'UNPLAYABLE' if is_bytevc2 else None,
-                'preference': -100 if is_bytevc2 else -1,
-                'filesize': traverse_obj(bitrate_info, ('PlayAddr', 'DataSize', {int_or_none})),
-            })
 
-            if dimension := (res and int(res[:-1])):
-                if dimension == 540:  # '540p' is actually 576p
-                    dimension = 576
-                if ratio < 1:  # portrait: res/dimension is width
-                    y = int(dimension / ratio)
-                    format_info.update({
-                        'width': dimension,
-                        'height': y - (y % 2),
-                    })
-                else:  # landscape: res/dimension is height
-                    x = int(dimension * ratio)
-                    format_info.update({
-                        'width': x + (x % 2),
-                        'height': dimension,
-                    })
+            if is_bytevc2:
+                format_info.update({
+                    'preference': -100,
+                    'format_note': join_nonempty(
+                        format_info.get('format_note'),
+                        'UNPLAYABLE',
+                        delim=', '),
+                })
+            else:
+                format_info.setdefault('preference', -1)
 
-            for video_url in traverse_obj(bitrate_info, ('PlayAddr', 'UrlList', ..., {url_or_none})):
+            url_key = get_bytedance_addr_url_key(play_addr)
+            if url_key:
+                bitrate_meta_by_url_key[url_key] = format_info.copy()
+
+            for video_url in traverse_obj(play_addr, ('UrlList', ..., {url_or_none})):
+                normalized_url = self._proto_relative_url(video_url)
+
+                bitrate_meta_by_url[normalized_url] = format_info.copy()
+
                 formats.append({
                     **COMMON_FORMAT_INFO,
                     **format_info,
-                    'url': self._proto_relative_url(video_url),
+                    'url': normalized_url,
                 })
 
-        # We don't have res string for play formats, but need quality for sorting & de-duplication
-        play_quality = traverse_obj(formats, (lambda _, v: v['width'] == play_width, 'quality', any))
+        # 用于 play format 的 quality 兜底：
+        # 如果 play_width 能在已有 bitrateInfo formats 中找到，就复用对应 quality。
+        play_quality = traverse_obj(formats, (lambda _, v: v.get('width') == play_width, 'quality', any))
 
-        for play_url in traverse_obj(video_info, ('playAddr', ((..., 'src'), None), {url_or_none})):
-            formats.append({
-                **COMMON_FORMAT_INFO,
-                'format_id': 'play',
-                'url': self._proto_relative_url(play_url),
+        # 2. 解析顶层 playAddr
+        #
+        # 不单独把 PlayAddrStruct.UrlList append 成新 format，避免和 bitrateInfo / playAddr 重复。
+        # PlayAddrStruct 更适合作为 playAddr 的 metadata 来源。
+        play_addr_struct = traverse_obj(video_info, ('PlayAddrStruct', {dict})) or {}
+        play_addr_url_key = get_bytedance_addr_url_key(play_addr_struct)
+
+        # 2.1 优先通过 UrlKey 匹配 bitrateInfo metadata
+        play_meta = bitrate_meta_by_url_key.get(play_addr_url_key, {}).copy() if play_addr_url_key else {}
+
+        # 2.2 如果没有匹配到 bitrateInfo，则从 PlayAddrStruct 自身解析
+        if not play_meta:
+            play_meta = build_bytedance_addr_meta(
+                play_addr_struct,
+                ratio=ratio,
+                allow_res_fallback=False)
+
+        # 2.3 PlayAddrStruct 没有宽高时，才使用顶层 video.width / video.height
+        # 顶层宽高只用于 play，不用于 bitrateInfo 多档。
+        if not play_meta.get('width') or not play_meta.get('height'):
+            play_meta.update(filter_dict({
                 'width': play_width,
                 'height': play_height,
-                'quality': play_quality,
+            }))
+
+        # 2.4 顶层 playAddr 没有 tbr / filesize 时，可用顶层字段弱兜底
+        # 注意：这只是 play 的弱兜底，不用于覆盖 bitrateInfo 多档。
+        if not play_meta.get('filesize'):
+            play_meta['filesize'] = int_or_none(video_info.get('size'))
+
+        if not play_meta.get('tbr'):
+            play_meta['tbr'] = int_or_none(video_info.get('bitrate'), scale=1000)
+
+        if not play_meta.get('vcodec'):
+            play_meta['vcodec'] = normalize_bytedance_vcodec(video_info.get('codecType'))
+
+        if not play_meta.get('quality'):
+            play_meta['quality'] = play_quality
+
+        play_meta = filter_dict(play_meta)
+
+        for play_url in traverse_obj(video_info, ('playAddr', ((..., 'src'), None), {url_or_none})):
+            normalized_url = self._proto_relative_url(play_url)
+
+            # 如果 play URL 和某个 bitrateInfo URL 一致，则复用 bitrateInfo metadata；
+            # 但 format_id 仍保留为 play，方便 list-formats 看出来源。
+            matched_meta = bitrate_meta_by_url.get(normalized_url, {}).copy()
+            if matched_meta:
+                current_play_meta = matched_meta
+            else:
+                current_play_meta = play_meta.copy()
+
+            formats.append({
+                **COMMON_FORMAT_INFO,
+                **filter_dict(current_play_meta),
+                'format_id': 'play',
+                'url': normalized_url,
             })
+
+        # 3. 解析 downloadAddr
+        #
+        # downloadAddr 通常可能是水印视频。
+        # 如果没有 DownloadAddrStruct，只能用顶层 video 字段做弱兜底；
+        # 不建议根据 UrlKey 强行推算，除非结构体里真的有 UrlKey。
+        download_addr_struct = traverse_obj(video_info, ('DownloadAddrStruct', {dict})) or {}
+
+        download_meta = build_bytedance_addr_meta(
+            download_addr_struct,
+            ratio=ratio,
+            allow_res_fallback=False)
+
+        # DownloadAddrStruct 不存在时，使用顶层 video 字段弱兜底
+        # 这里不保证绝对准确，但比 list-formats unknown 更有参考价值。
+        if not download_meta.get('width') or not download_meta.get('height'):
+            download_meta.update(filter_dict({
+                'width': play_width,
+                'height': play_height,
+            }))
+
+        if not download_meta.get('filesize'):
+            download_meta['filesize'] = int_or_none(video_info.get('size'))
+
+        if not download_meta.get('tbr'):
+            download_meta['tbr'] = int_or_none(video_info.get('bitrate'), scale=1000)
+
+        if not download_meta.get('vcodec'):
+            download_meta['vcodec'] = normalize_bytedance_vcodec(video_info.get('codecType')) or 'h264'
+
+        download_meta['acodec'] = download_meta.get('acodec') or 'aac'
+
+        download_meta = filter_dict(download_meta)
 
         for download_url in traverse_obj(video_info, (('downloadAddr', ('download', 'url')), {url_or_none})):
             formats.append({
                 **COMMON_FORMAT_INFO,
+                **download_meta,
                 'format_id': 'download',
                 'url': self._proto_relative_url(download_url),
-                'format_note': 'watermarked',
+                'format_note': join_nonempty(
+                    download_meta.get('format_note'),
+                    'watermarked',
+                    delim=', '),
                 'preference': -2,
             })
 
         self._remove_duplicate_formats(formats)
 
-        # Is it a slideshow with only audio for download?
+        # 4. slideshow 音频兜底
+        #
+        # 如果没有任何视频 format，但存在 music.playUrl，则按音频处理。
         if not formats and traverse_obj(aweme_detail, ('music', 'playUrl', {url_or_none})):
             audio_url = aweme_detail['music']['playUrl']
             ext = traverse_obj(parse_qs(audio_url), (
@@ -642,8 +789,12 @@ class TikTokBaseIE(InfoExtractor):
                 'vcodec': 'none',
             })
 
-        # Filter out broken formats, see https://github.com/yt-dlp/yt-dlp/issues/11034
-        return [f for f in formats if urllib.parse.urlparse(f['url']).hostname != 'www.tiktok.com']
+        # 过滤 TikTok 已知坏格式
+        # 参见 yt-dlp ：https://github.com/yt-dlp/yt-dlp/issues/11034
+        return [
+            f for f in formats
+            if urllib.parse.urlparse(f['url']).hostname != 'www.tiktok.com'
+        ]
 
     def _parse_aweme_video_web(self, aweme_detail, webpage_url, video_id, extract_flat=False):
         author_info = traverse_obj(aweme_detail, (('authorInfo', 'author', None), {
@@ -1349,7 +1500,11 @@ class TikTokCollectionIE(TikTokBaseIE):
 
 
 class DouyinIE(TikTokBaseIE):
-    _VALID_URL = r'https?://(?:www\.)?douyin\.com/video/(?P<id>[0-9]+)'
+    # 兼容：
+    #   https://www.douyin.com/video/<aweme_id>
+    #   https://www.douyin.com/jingxuan?modal_id=<aweme_id>
+    #   https://www.douyin.com/follow/search/...?...&modal_id=<aweme_id>
+    _VALID_URL = r'https?://(?:www\.)?douyin\.com/(?:video/(?P<id>[0-9]+)|[^?#]*\?(?:[^#]*&)?modal_id=(?P<modal_id>[0-9]+))'
     _TESTS = [{
         'url': 'https://www.douyin.com/video/6961737553342991651',
         'md5': '9ecce7bc5b302601018ecb2871c63a75',
@@ -1468,24 +1623,287 @@ class DouyinIE(TikTokBaseIE):
             'save_count': int,
             'thumbnail': r're:https?://.+\.jpe?g',
         },
+    }, {
+        'url': 'https://www.douyin.com/jingxuan?modal_id=7615828879340552036',
+        'only_matching': True,
+    }, {
+        'url': 'https://www.douyin.com/follow/search/asd?aid=c2a3668d-0594-4f50-acf6-7c265fb80ee2&modal_id=7422307345595731236&type=general',
+        'only_matching': True,
     }]
     _UPLOADER_URL_FORMAT = 'https://www.douyin.com/user/%s'
     _WEBPAGE_HOST = 'https://www.douyin.com/'
 
+    # def _real_extract(self, url):
+    #     video_id = self._match_id(url)
+    #
+    #     detail = traverse_obj(self._download_json(
+    #         'https://www.douyin.com/aweme/v1/web/aweme/detail/', video_id,
+    #         'Downloading web detail JSON', 'Failed to download web detail JSON',
+    #         query={'aweme_id': video_id}, fatal=False), ('aweme_detail', {dict}))
+    #     if not detail:
+    #         # TODO: Run verification challenge code to generate signature cookies
+    #         raise ExtractorError(
+    #             'Fresh cookies (not necessarily logged in) are needed',
+    #             expected=not self._get_cookies(self._WEBPAGE_HOST).get('s_v_web_id'))
+    #
+    #     return self._parse_aweme_video_app(detail)
+
     def _real_extract(self, url):
-        video_id = self._match_id(url)
+        mobj = self._match_valid_url(url)
+        video_id = mobj.group('id') or mobj.group('modal_id')
 
-        detail = traverse_obj(self._download_json(
-            'https://www.douyin.com/aweme/v1/web/aweme/detail/', video_id,
-            'Downloading web detail JSON', 'Failed to download web detail JSON',
-            query={'aweme_id': video_id}, fatal=False), ('aweme_detail', {dict}))
+        # Strategy 1:
+        #   aweme/detail Web API + a_bogus
+        #
+        # 优点：
+        # - 返回结构接近 App API；
+        # - 可以直接复用 _parse_aweme_video_app；
+        # - 当前测试对高分辨率更友好。
+        detail = self._extract_douyin_aweme_detail_api(video_id)
+        if detail:
+            return self._parse_aweme_video_app(detail)
+
+        # Strategy 2:
+        #   SSR webpage RENDER_DATA + __ac_nonce + __ac_signature
+        #
+        # 优点：
+        # - API 空响应时还能从页面拿 videoDetail；
+        # - modal_id 链路天然适配。
+        return self._extract_douyin_render_data(url, video_id)
+
+    def _extract_douyin_aweme_detail_api(self, video_id):
+        """
+        通过 Douyin aweme/detail Web API 获取 aweme_detail。
+
+        该方法 non-fatal：
+        - 失败时返回 None；
+        - 由 _real_extract 自动 fallback 到 RENDER_DATA 页面方案。
+        """
+        user_agent = DOUYIN_USER_AGENT
+
+        ensure_douyin_cookies(self, video_id, user_agent)
+
+        query = sign_aweme_detail_query(
+            build_aweme_detail_query(video_id),
+            user_agent)
+
+        response = self._download_json(
+            AWEME_DETAIL_API_URL,
+            video_id,
+            'Downloading Douyin web detail JSON',
+            'Failed to download Douyin web detail JSON',
+            query=query,
+            headers={
+                'User-Agent': user_agent,
+                'Referer': self._WEBPAGE_HOST,
+            },
+            fatal=False)
+
+        detail = traverse_obj(response, ('aweme_detail', {dict}))
+
         if not detail:
-            # TODO: Run verification challenge code to generate signature cookies
-            raise ExtractorError(
-                'Fresh cookies (not necessarily logged in) are needed',
-                expected=not self._get_cookies(self._WEBPAGE_HOST).get('s_v_web_id'))
+            self.write_debug('Douyin aweme/detail API returned no aweme_detail')
 
-        return self._parse_aweme_video_app(detail)
+        return detail
+
+    def _extract_douyin_render_data(self, url, video_id):
+        """
+        通过 Douyin SSR RENDER_DATA 获取 videoDetail。
+        """
+        user_agent = DOUYIN_USER_AGENT
+        request_headers = {
+            **DOUYIN_DEFAULT_WEB_HEADERS,
+            'User-Agent': user_agent,
+        }
+
+        ensure_douyin_cookies(self, video_id, user_agent, request_headers)
+
+        jingxuan_url = make_jingxuan_url(video_id)
+
+        urls_to_try = []
+        # 经测试，目前只看到 Douyin 精选页 modal_id SSR 页面可以通过 RENDER_DATA 返回 videoDetail，其他页面没有 视频信息
+        # if url != jingxuan_url:
+        #     urls_to_try.append(url)
+        urls_to_try.append(jingxuan_url)
+
+        for webpage_url in urls_to_try:
+            webpage = self._download_douyin_webpage(webpage_url, video_id, request_headers)
+            if not webpage:
+                continue
+
+            render_data = extract_render_data_json(self, webpage, video_id)
+            video_detail = extract_video_detail(render_data)
+
+            self.write_debug(
+                f'Douyin RENDER_DATA extraction: url={webpage_url}, '
+                f'webpage_len={len(webpage)}, videoDetail={bool(video_detail)}')
+
+            if video_detail:
+                return self._parse_douyin_videodetail(video_detail, video_id, webpage_url)
+
+        raise ExtractorError(
+            'Unable to extract Douyin video info. Try providing fresh Douyin cookies '
+            'with --cookies-from-browser or --cookies',
+            expected=True)
+
+    def _download_douyin_webpage(self, url, video_id, headers):
+        """
+        下载 Douyin 页面。
+
+        注意：
+        - 通过手动 Cookie Header 解决部分 cookie domain/path 匹配问题；
+        - 请求仍走 yt-dlp 自己的网络层，因此代理等参数继续生效。
+        """
+
+        cookie_header = build_douyin_cookie_header(
+            self._get_cookies(self._WEBPAGE_HOST))
+
+        return self._download_webpage(
+            url,
+            video_id,
+            'Downloading Douyin video webpage',
+            headers={
+                **headers,
+                **({'Cookie': cookie_header} if cookie_header else {}),
+            },
+            fatal=False)
+
+    def _extract_douyin_web_formats(self, video_info):
+        """
+        解析 Douyin SSR RENDER_DATA videoDetail.video 结构中的 formats。
+
+        这里使用 tiktok/formats.py 中的通用增强解析：
+        - 如果 bitRateList / playAddr 中存在 UrlKey，则统一解析；
+        - width / height / filesize / fps 优先使用结构化字段；
+        - UrlKey 主要补 format_id / vcodec / tbr / quality。
+        """
+        formats = []
+
+        play_width = int_or_none(video_info.get('width'))
+        play_height = int_or_none(video_info.get('height'))
+
+        for bitrate_info in traverse_obj(video_info, ('bitRateList', lambda _, v: v.get('playAddr'))):
+            # Douyin SSR 可能出现 dash 结构。当前下载优先使用 progressive mp4。
+            if bitrate_info.get('format') == 'dash':
+                continue
+
+            format_info = build_douyin_web_bitrate_meta(bitrate_info)
+
+            # bytevc2 is bytedance's own custom h266/vvc codec, as-of-yet unplayable
+            is_bytevc2 = format_info.get('vcodec') == 'bytevc2'
+            if is_bytevc2:
+                format_info.update({
+                    'preference': -100,
+                    'format_note': join_nonempty(
+                        format_info.get('format_note'),
+                        'UNPLAYABLE',
+                        delim=', '),
+                })
+            else:
+                format_info.setdefault('preference', -1)
+
+            # playAddr 在 RENDER_DATA 中通常是列表，每个元素可能有 src。
+            # 为减少重复，每个 bitrate 只取第一个可用镜像。
+            for video_url in traverse_obj(bitrate_info, ('playAddr', ..., 'src', {url_or_none})):
+                formats.append({
+                    'url': self._proto_relative_url(video_url),
+                    'ext': 'mp4',
+                    'vcodec': 'h264',
+                    'acodec': 'aac',
+                    **format_info,
+                })
+                break
+
+        # fallback：顶层 playAddr。
+        if not formats:
+            for play_url in traverse_obj(video_info, ('playAddr', ..., 'src', {url_or_none})):
+                formats.append({
+                    'url': self._proto_relative_url(play_url),
+                    'ext': 'mp4',
+                    'format_id': 'play',
+                    'width': play_width,
+                    'height': play_height,
+                    'vcodec': 'h264',
+                    'acodec': 'aac',
+                })
+
+        # 水印下载地址。
+        for dl_url in traverse_obj(video_info, (('download', None), 'url', {url_or_none})):
+            formats.append({
+                'url': self._proto_relative_url(dl_url),
+                'ext': 'mp4',
+                'vcodec': 'h264',
+                'acodec': 'aac',
+                'format_id': 'download',
+                'format_note': 'watermarked',
+                'preference': -2,
+            })
+            break
+
+        self._remove_duplicate_formats(formats)
+        return formats
+
+    def _parse_douyin_videodetail(self, video_detail, video_id, webpage_url):
+        """
+        将 Douyin SSR videoDetail 结构转换为 yt-dlp info dict。
+        """
+        author_info = traverse_obj(video_detail, (('authorInfo', 'author', None), {
+            'channel': ('nickname', {str}),
+            'channel_id': (('secUid', 'authorSecId'), {str}),
+            'uploader': (('uniqueId', 'shortId', 'nickname'), {str}),
+            'uploader_id': (('uid', 'authorUserId', 'id'), {str_or_none}),
+        }), get_all=False) or {}
+
+        video_info = traverse_obj(video_detail, ('video', {dict})) or {}
+
+        thumbnails = [
+            {
+                'url': self._proto_relative_url(thumb_url),
+            }
+            for thumb_url in traverse_obj(video_info, (
+                ('coverUrlList', 'cover169UrlList'), ..., {url_or_none}))
+        ]
+
+        if not thumbnails:
+            thumbnails = [
+                {
+                    'url': self._proto_relative_url(cover_url),
+                }
+                for cover_url in traverse_obj(video_info, (('cover', 'thumbnail'), {url_or_none}))
+            ]
+
+        return {
+            'id': video_id,
+            'formats': self._extract_douyin_web_formats({
+                **video_info,
+                'download': video_detail.get('download'),
+            }),
+            'http_headers': {'Referer': webpage_url},
+            **author_info,
+            'channel_url': format_field(
+                author_info, 'channel_id', self._UPLOADER_URL_FORMAT, default=None),
+            'uploader_url': format_field(
+                author_info, ['uploader', 'uploader_id'], self._UPLOADER_URL_FORMAT, default=None),
+            **traverse_obj(video_detail, ('music', {
+                'track': ('title', {str}),
+                'artists': ('author', {str}, {lambda x: [x] if x else None}),
+                'duration': ('duration', {int_or_none}),
+            })),
+            **traverse_obj(video_detail, {
+                'title': (('itemTitle', 'desc'), {truncate_string(left=72)}, filter),
+                'description': ('desc', {str}),
+                'duration': ('video', 'duration', {lambda x: int_or_none(x, scale=1000)}, filter),
+                'timestamp': ('createTime', {int_or_none}),
+            }),
+            **traverse_obj(video_detail, ('stats', {
+                'view_count': 'playCount',
+                'like_count': 'diggCount',
+                'repost_count': 'shareCount',
+                'comment_count': 'commentCount',
+                'save_count': 'collectCount',
+            }), expected_type=int_or_none),
+            'thumbnails': thumbnails,
+        }
 
 
 class TikTokVMIE(InfoExtractor):
