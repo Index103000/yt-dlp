@@ -302,7 +302,7 @@ class TikTokBaseIE(InfoExtractor):
         video_data, status = {}, -1
 
         def get_webpage(note='Downloading webpage'):
-            res = self._download_webpage_handle(url, video_id, note, fatal=fatal, impersonate=True)
+            res = self._download_webpage_handle(url, video_id, note, fatal=fatal, impersonate=False)
             if res is False:
                 return False
 
