@@ -300,9 +300,10 @@ class TikTokBaseIE(InfoExtractor):
 
     def _extract_web_data_and_status(self, url, video_id, fatal=True):
         video_data, status = {}, -1
+        headers = self._generate_blockbuster_headers()
 
         def get_webpage(note='Downloading webpage'):
-            res = self._download_webpage_handle(url, video_id, note, fatal=fatal, impersonate=False)
+            res = self._download_webpage_handle(url, video_id, note, fatal=fatal, headers=headers)
             if res is False:
                 return False
 
@@ -661,6 +662,13 @@ class TikTokBaseIE(InfoExtractor):
                     **COMMON_FORMAT_INFO,
                     **format_info,
                     'url': normalized_url,
+                    # Some bytevc1 formats are video-only or may return HTTP Error 404
+                    # See: https://github.com/yt-dlp/yt-dlp/issues/16622
+                    #      https://github.com/yt-dlp/yt-dlp/issues/17372
+                    **({
+                        'acodec': 'none',
+                        '__needs_testing': True,
+                    } if urllib.parse.urlparse(video_url).path.endswith('/media-video-hvc1/') else {}),
                 })
 
         # 用于 play format 的 quality 兜底：
@@ -770,15 +778,13 @@ class TikTokBaseIE(InfoExtractor):
                     'watermarked',
                     delim=', '),
                 'preference': -2,
+                '__needs_testing': True,
             })
 
         self._remove_duplicate_formats(formats)
 
-        # 4. slideshow 音频兜底
-        #
-        # 如果没有任何视频 format，但存在 music.playUrl，则按音频处理。
-        if not formats and traverse_obj(aweme_detail, ('music', 'playUrl', {url_or_none})):
-            audio_url = aweme_detail['music']['playUrl']
+        # 4. 音频
+        if audio_url := traverse_obj(aweme_detail, ('music', 'playUrl', {url_or_none})):
             ext = traverse_obj(parse_qs(audio_url), (
                 'mime_type', -1, {lambda x: x.replace('_', '/')}, {mimetype2ext})) or 'm4a'
             formats.append({
@@ -846,7 +852,7 @@ class TikTokBaseIE(InfoExtractor):
 
 
 class TikTokIE(TikTokBaseIE):
-    _VALID_URL = r'https?://www\.tiktok\.com/(?:embed|@(?P<user_id>[\w\.-]+)?/video)/(?P<id>\d+)'
+    _VALID_URL = r'https?://www\.tiktokv?\.com/(?:embed|(?:share|@(?P<user_id>[\w\.-]+)?)/video)/(?P<id>\d+)'
     _EMBED_REGEX = [rf'<(?:script|iframe)[^>]+\bsrc=(["\'])(?P<url>{_VALID_URL})']
 
     _TESTS = [{
@@ -1120,6 +1126,15 @@ class TikTokIE(TikTokBaseIE):
         # Auto-captions available
         'url': 'https://www.tiktok.com/@hankgreen1/video/7047596209028074758',
         'only_matching': True,
+    }, {
+        'url': 'https://www.tiktokv.com/share/video/7668090902816017671/',
+        'only_matching': True,
+    }, {
+        'url': 'https://www.tiktok.com/share/video/7668090902816017671/',
+        'only_matching': True,
+    }, {
+        'url': 'https://www.tiktok.com/@/video/7668090902816017671/',
+        'only_matching': True,
     }]
 
     def _real_extract(self, url):
@@ -1306,7 +1321,7 @@ class TikTokUserIE(TikTokBaseIE):
             webpage = self._download_webpage(
                 self._UPLOADER_URL_FORMAT % user_name, user_name,
                 'Downloading user webpage', 'Unable to download user webpage',
-                fatal=False, impersonate=True) or ''
+                fatal=False, headers=self._generate_blockbuster_headers()) or ''
             detail = traverse_obj(
                 self._get_universal_data(webpage, user_name), ('webapp.user-detail', {dict})) or {}
             video_count = traverse_obj(detail, ('userInfo', ('stats', 'statsV2'), 'videoCount', {int}, any))
@@ -2031,7 +2046,8 @@ class TikTokLiveIE(TikTokBaseIE):
         uploader, room_id = self._match_valid_url(url).group('uploader', 'id')
         if not room_id:
             webpage = self._download_webpage(
-                format_field(uploader, None, self._UPLOADER_URL_FORMAT), uploader, impersonate=True)
+                format_field(uploader, None, self._UPLOADER_URL_FORMAT), uploader,
+                headers=self._generate_blockbuster_headers())
             room_id = traverse_obj(
                 self._get_universal_data(webpage, uploader),
                 ('webapp.user-detail', 'userInfo', 'user', 'roomId', {str}))
