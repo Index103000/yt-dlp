@@ -677,7 +677,8 @@ class TikTokBaseIE(InfoExtractor):
 
         # 用于 play format 的 quality 兜底：
         # 如果 play_width 能在已有 bitrateInfo formats 中找到，就复用对应 quality。
-        play_quality = traverse_obj(formats, (lambda _, v: play_width and v.get("width") == play_width, "quality", any))
+        play_quality = traverse_obj(formats, (
+            lambda _, v: play_width and v.get('width') == play_width, 'quality', any))
 
         # 2. 解析顶层 playAddr
         #
