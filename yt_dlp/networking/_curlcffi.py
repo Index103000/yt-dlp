@@ -175,9 +175,9 @@ BROWSER_TARGETS: dict[tuple[int, ...], dict[str, ImpersonateTarget]] = {
         'firefox144': ImpersonateTarget('firefox', '144', 'macos', '26'),
         'firefox147': ImpersonateTarget('firefox', '147', 'macos', '26'),
     },
-    (0, 16, 1): {
-        'chrome150': ImpersonateTarget('chrome', '150', 'macos', '26'),
-    },
+    # (0, 16, 1): {
+    #     'chrome150': ImpersonateTarget('chrome', '150', 'macos', '26'),
+    # },
 }
 
 # Needed for curl_cffi < 0.11
