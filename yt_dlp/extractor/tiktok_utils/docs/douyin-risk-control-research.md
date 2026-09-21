@@ -27,6 +27,8 @@ API 响应带 `filter_reason`（视频不存在等）时直接报错，不再尝
 
 下载视频时，两个 API 策略的格式都必须带 `Referer`，见 2.4。
 
+另有 App feed 接口也能绕开 Argus，但实测最高只有 720p，未接入，见 2.8。
+
 ------
 
 ## 2. 机制详解
@@ -149,6 +151,35 @@ Referer: https://open.douyin.com
 - `TikTokIE._TESTS` 中多数视频锁区（`Your IP address is blocked from accessing this post`，换巴西 IP 也一样）；
   当时可访问的样本：`pokemonlife22/7059698374567611694`、`hankgreen1/7047596209028074758`，`tatemcrae/7107337212743830830` 仅国内直连（经本机代理）可访问。
 
+### 2.8 App feed（未接入，仅实测）
+
+抖音手机 App 的推荐流接口，即 App 里上下刷视频时拉取视频列表的接口（方案来自 4. 参考项目中的 Diana、media-parser）：
+
+```
+GET https://api5-normal-c-hl.amemv.com/aweme/v1/feed/?aweme_id=<id>&aid=1128
+GET https://aweme.snssdk.com/aweme/v1/feed/?aweme_id=<id>&aid=1128        （备用域名）
+User-Agent: com.ss.android.ugc.aweme/300904 (Linux; U; Android 12; zh_CN; SM-G9730; Build/SQ3A.220705.004; Cronet/TTNetVersion:2e47e0ce 2022-05-19)
+```
+
+- 走 App 的接口域名，不经过网页 `www.douyin.com` 的 Argus；`aid=1128` 是 App 的应用 ID（网页为 6383）；不需要 Cookie 和签名；
+- 返回 `aweme_list`：带 `aweme_id` 时目标视频排在第一个，后面混入推荐视频，要按 `aweme_id` 挑，不能直接取第一个。
+
+实测（2026-09-21，国内移动直连，两个域名结果相同）：
+
+| 视频 | 返回 | 目标位置 | `bit_rate` 档数 | 最高画质 | open API 对照 |
+| --- | --- | --- | --- | --- | --- |
+| 7686096925641338809 | 7 个视频 | 第 1 个 | 7 | 1280x720 | 29 档，最高 2560x1440 |
+| 6961737553342991651（老视频） | 7 个视频 | 第 1 个 | 2 | 720x1280 | — |
+
+限制：
+
+- **画质最高 720p**，档位也少得多，远不如 open API 和页面方案（都能拿到 2K）；
+- App 协议的多数接口要求 `X-Gorgon` / `X-Argus` 等签名，这个接口目前不查，随时可能补上；
+- 图集类作品不支持（media-parser 让图集改走网页接口）；
+- 未在海外、电信网络下测过。
+
+所以它只适合做最后兜底，排在页面方案之后。
+
 ------
 
 ## 3. 排查方法
@@ -249,9 +280,9 @@ for i in range(5):
 | yt-dlp 上游 issue #9667 | [yt-dlp/yt-dlp#9667](https://github.com/yt-dlp/yt-dlp/issues/9667) | 上游 Douyin「Fresh cookies needed」问题的主 issue（仍 open） | 看上游是否有官方修复 |
 | f2 | [Johnserf-Seed/f2](https://github.com/Johnserf-Seed/f2) | 多平台下载器，`ABogus` 算法原始出处（Apache 2.0） | `a_bogus` 算法版本更新 |
 | gmssl | PR 中链接 [duanhongyi/gmssl](https://github.com/duanhongyi/gmssl)，现为 [py-gmssl/py-gmssl](https://github.com/py-gmssl/py-gmssl)（GitHub 显示 MIT） | SM3 纯 Python 实现 | SM3 实现有疑问时对照 |
-| Diana PR #612 | [SuInk/Diana#612](https://github.com/SuInk/Diana/pull/612) | 三级回退：① open.douyin.com 来源免签名 detail；② App feed 接口 `api5-normal-c-hl.amemv.com` / `aweme.snssdk.com` 的 `/aweme/v1/feed/`，按 `aweme_id` 过滤；③ 老的 Cookie + `uifid` + `a_bogus`（仍 403） | open API 被堵时，App feed 是下一个候选 |
+| Diana PR #612 | [SuInk/Diana#612](https://github.com/SuInk/Diana/pull/612) | 三级回退：① open.douyin.com 来源免签名 detail；② App feed 接口 `api5-normal-c-hl.amemv.com` / `aweme.snssdk.com` 的 `/aweme/v1/feed/`，`aid=1128` + 安卓 App UA，按 `aweme_id` 过滤（我们实测最高 720p，见 2.8）；③ 老的 Cookie + `uifid` + `a_bogus`（仍 403） | open API 与页面方案都失效时，App feed 可作最后兜底 |
 | nonebot-plugin-parser-lite PR #311 / #312 | [#311](https://github.com/sokoko-org/nonebot-plugin-parser-lite/pull/311)、[#312](https://github.com/sokoko-org/nonebot-plugin-parser-lite/pull/312) | 同样改用 open.douyin.com 来源，只带 `aweme_id` + `aid`，不再发 `ttwid` 和浏览器 / 设备参数 | 同上 |
-| media-parser Issue #15 | [ucmao/media-parser#15](https://github.com/ucmao/media-parser/issues/15) | 根因分析：Argus 对缺少真实浏览器 `UIFID` 的匿名请求按概率拦截（报告拦截率 40%–50%）；主通道改用移动端 feed 协议 `api5-normal-c-hl.amemv.com`（称 0% 403），图集走 Web API + 指数退避 | 需要 App 协议方案、或评估国内拦截概率时 |
+| media-parser Issue #15 | [ucmao/media-parser#15](https://github.com/ucmao/media-parser/issues/15) | 根因分析：Argus 对缺少真实浏览器 `UIFID` 的匿名请求按概率拦截（报告拦截率 40%–50%）；主通道改用移动端 feed 协议 `api5-normal-c-hl.amemv.com`（称 0% 403、覆盖 95% 以上普通视频；我们实测最高 720p，见 2.8），图集走 Web API + 指数退避 | 需要 App 协议方案、或评估国内拦截概率时 |
 | nous-app PR #2360 | [iocrazy/nous-app#2360](https://github.com/iocrazy/nous-app/pull/2360) | 实现 Argus webSign：`x-secsdk-web-signature`，Node 子进程跑 `websign_env.js` / `websign_runtime.js`，先 `a_bogus` 再 webSign，输入为带 `a_bogus` 的 URL、时间戳、`uifid` | 决定自己实现 webSign 时 |
 | amagi PR #188 | [ikenxuan/amagi#188](https://github.com/ikenxuan/amagi/pull/188) | ① 免鉴权接口：`iesdouyin.com/web/api/v2/user/info/`（用户名转 `sec_uid`）、`/v2/music/info/`、`/v2/music/list/aweme/`、`api.amemv.com/aweme/v1/im/resources/emoji/`；② `webid` 与会话 Cookie 不匹配时服务端静默返回 200 空响应，改为读响应头 `cookie_ttwidinfo_webid` 按 `ttwid` 缓存；③ `x-secsdk-web-signature` 为 32 位小写 hex、放在 query 中，只对 SDK 策略表中的部分路径生效，必须是最后一步；④ Argus 拦截时重新生成 `msToken` / `verifyFp` / `a_bogus` 线性退避重试最多 5 次 | 扩展到用户主页、音乐等接口，或遇到莫名 200 空响应时 |
 | douyin-downloader | [jiji262/douyin-downloader](https://github.com/jiji262/douyin-downloader) | 说明 Argus 对非浏览器请求返回 `Uifid Not Found`、webSign 只能在真实页面内生成；主页批量翻页被拦时用 Playwright 启动真实浏览器滚动采集（默认有头，需手动过验证码） | 需要浏览器兜底方案时 |
@@ -273,7 +304,8 @@ for i in range(5):
    区分方法：在电信机器上 `nslookup www.douyin.com` 拿到它实际访问的节点 IP，
    从移动网络用 `curl --resolve www.douyin.com:443:<IP>` 把 web API 请求发到该节点（先确认 `via` 是 `CHN-...-CT5-...` 这类节点）。
    也被拦就是按节点，能过就是按客户端 IP。
-2. **open API 被堵后的下一步**：优先评估 App feed 接口（Diana、media-parser 的方案）；
-   其次是 webSign（nous-app 的 Node 方案，工作量大、需跟随 SDK 更新）；页面方案始终作为最后兜底。
+2. **open API 被堵后的下一步**：页面方案能拿到 2K，仍是首选兜底；
+   要找新的高画质 API 通道，只能实现 webSign（nous-app 的 Node 方案，工作量大、需跟随 SDK 更新）；
+   App feed 实测最高 720p，只在页面方案也失效时作最后兜底（见 2.8）。
 3. **其他 `filter_reason`**：遇到已删除、私密、地区限制的视频时，补充对应的 `filter_reason` 取值和页面表现。
 4. **`webid`**：目前两个 API 策略都不带 `webid`；将来若加上，注意 amagi 发现的「`webid` 与会话不匹配则 200 空响应」。
