@@ -1717,7 +1717,9 @@ class DouyinIE(TikTokBaseIE):
         失败原因保留服务端的原始信息，便于从日志判断是被拦截、签名无效还是视频本身不可用：
         - 非 200：状态码 + 响应体，例如 HTTP 403: Blocked by ArgusSecurityPlugin Uifid Not Found；
         - 200 空响应体 / 非 JSON；
-        - JSON 中没有 aweme_detail：附上 status_code 与 filter_detail（视频不存在时为 filter_reason=core_dep）。
+        - JSON 中没有 aweme_detail：附上 status_code 与 filter_detail。
+
+        带 filter_reason 的响应（视频不存在时为 core_dep）直接抛出 ExtractorError，不再尝试后续策略。
         """
         try:
             body, urlh = self._download_webpage_handle(
@@ -1742,13 +1744,19 @@ class DouyinIE(TikTokBaseIE):
         if detail:
             return detail, None
 
+        filter_detail = traverse_obj(data, ('filter_detail', {dict})) or {}
         fields = {
             'status_code': data.get('status_code'),
             'status_msg': data.get('status_msg'),
-            **{k: v for k, v in (traverse_obj(data, ('filter_detail', {dict})) or {}).items() if k != 'aweme_id'},
+            **{k: v for k, v in filter_detail.items() if k != 'aweme_id'},
         }
-        return None, 'no aweme_detail in response ({})'.format(
-            ', '.join(f'{k}={v}' for k, v in fields.items() if v not in (None, '')))
+        fields = ', '.join(f'{k}={v}' for k, v in fields.items() if v not in (None, ''))
+
+        if filter_detail.get('filter_reason'):
+            # 服务端明确给出过滤原因（视频不存在时为 core_dep），页面方案同样拿不到（videoDetail 为 null），不再回退
+            raise ExtractorError(f'Douyin video is unavailable ({fields})', expected=True, video_id=video_id)
+
+        return None, f'no aweme_detail in response ({fields})'
 
     def _extract_douyin_render_data(self, video_id):
         """

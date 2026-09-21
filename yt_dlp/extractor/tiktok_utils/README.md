@@ -104,7 +104,8 @@ tiktok_utils/douyin/render_data.py
       `ac_signature_matches_nonce` 判断是否重算，而不是看签名是否存在。
 
 两个 API 策略的格式都需要 `http_headers` 带 `Referer`，否则 douyinvod 的 v26-web 等节点返回 403。
-视频不存在时，两个 API 都返回 200 + `filter_detail.filter_reason=core_dep`，页面的 `videoDetail` 为 null。
+视频不存在时，两个 API 都返回 200 + `filter_detail.filter_reason=core_dep`，页面的 `videoDetail` 为 null；
+因此 API 响应带 `filter_reason` 时直接报错「Douyin video is unavailable」，不再尝试后续策略。
 
 ------
 
