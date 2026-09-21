@@ -6,6 +6,8 @@ yt_dlp/extractor/
 └── tiktok_utils/
     ├── __init__.py
     ├── formats.py
+    ├── docs/
+    │   └── douyin-risk-control-research.md
     └── douyin/
         ├── __init__.py
         ├── constants.py
@@ -81,6 +83,13 @@ tiktok_utils/douyin/render_data.py
 | API 参数变化                      | `tiktok_utils/douyin/api.py`                          |
 | RENDER_DATA 结构变化              | `tiktok_utils/douyin/render_data.py`                  |
 | UrlKey 格式变化                   | `tiktok_utils/formats.py`                             |
+
+------
+
+## 参考文档
+
+- [docs/douyin-risk-control-research.md](docs/douyin-risk-control-research.md)：抖音 / TikTok 风控调研记录，
+  包括各风控机制的实测结论、排查方法与诊断脚本、参考过的外部项目及其方案。
 
 ------
 
