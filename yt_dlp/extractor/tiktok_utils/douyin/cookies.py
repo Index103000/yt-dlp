@@ -1,60 +1,11 @@
-# yt_dlp/extractor/tiktok/douyin/cookies.py
+# yt_dlp/extractor/tiktok_utils/douyin/cookies.py
 from __future__ import annotations
 
 import json
 
-from .ac_signature import get_ac_signature
-from .constants import DOUYIN_WEBPAGE_HOST
+from .ac_signature import ac_signature_matches_nonce, get_ac_signature
+from .constants import DOUYIN_AC_SIGNATURE_SITE, DOUYIN_DEFAULT_WEB_HEADERS, DOUYIN_WEBPAGE_HOST
 from .tokens import generate_ms_token, generate_s_v_web_id
-
-
-DOUYIN_COOKIE_PREFERRED_ORDER = [
-    'ttwid',
-    's_v_web_id',
-    'msToken',
-    '__ac_nonce',
-    '__ac_signature',
-    'passport_csrf_token',
-    'passport_csrf_token_default',
-    'sid_tt',
-    'sessionid',
-    'sessionid_ss',
-    'uid_tt',
-    'uid_tt_ss',
-    'odin_tt',
-]
-
-
-def build_douyin_cookie_header(cookies) -> str:
-    """
-    从 yt-dlp cookie mapping 构造 Cookie Header。
-
-    参数：
-        cookies:
-            通常来自 ie._get_cookies(DOUYIN_WEBPAGE_HOST)。
-
-    说明：
-    - 不打印 Cookie 原值；
-    - 优先排列关键 Cookie，便于调试；
-    - 兼容用户通过 --cookies / --cookies-from-browser 传入的 Cookie。
-    """
-    pairs = []
-    used = set()
-
-    for name in DOUYIN_COOKIE_PREFERRED_ORDER:
-        cookie = cookies.get(name)
-        if cookie and cookie.value:
-            pairs.append(f'{name}={cookie.value}')
-            used.add(name)
-
-    for name, cookie in cookies.items():
-        if name in used:
-            continue
-        if not cookie.value:
-            continue
-        pairs.append(f'{name}={cookie.value}')
-
-    return '; '.join(pairs)
 
 
 def cookie_state_debug(cookies) -> str:
@@ -129,7 +80,7 @@ def register_douyin_ttwid(ie, video_id, user_agent):
         ie.write_debug('Douyin ttwid was not found in Set-Cookie')
 
 
-def fetch_douyin_home_cookies(ie, video_id, headers, note='Fetching Douyin home cookies'):
+def fetch_douyin_home_cookies(ie, video_id, user_agent, note='Fetching Douyin home cookies'):
     """
     请求 Douyin 首页，让服务端下发基础 Cookie。
 
@@ -144,7 +95,10 @@ def fetch_douyin_home_cookies(ie, video_id, headers, note='Fetching Douyin home 
         note=note,
         errnote=False,
         fatal=False,
-        headers=headers)
+        headers={
+            **DOUYIN_DEFAULT_WEB_HEADERS,
+            'User-Agent': user_agent,
+        })
 
 
 def clear_douyin_cookie(ie, name):
@@ -160,13 +114,12 @@ def clear_douyin_cookie(ie, name):
             ie.cookiejar.clear(cookie.domain, cookie.path, cookie.name)
 
 
-def ensure_douyin_cookies(ie, video_id, user_agent, headers=None):
+def ensure_douyin_visitor_cookies(ie, video_id, user_agent):
     """
-    准备 Douyin Web 匿名访问 Cookie。
+    准备 Douyin Web 匿名访客 Cookie，aweme/detail API 方案只需要这些。
 
-    重点 Cookie：
     1. ttwid
-        Douyin / ByteDance Web 访客标识。
+        Douyin / ByteDance Web 访客标识。实测 API 只带 ttwid 即可返回 aweme_detail，缺失则为空响应。
 
     2. s_v_web_id
         Web 访客标识，本地生成。
@@ -174,78 +127,59 @@ def ensure_douyin_cookies(ie, video_id, user_agent, headers=None):
     3. msToken
         Web 环境 token，本地随机生成。
 
-    4. __ac_nonce
-        通常由 www.douyin.com 首页响应 Set-Cookie 返回。
-
-    5. __ac_signature
-        基于 host + __ac_nonce + User-Agent 生成。
-
     注意：
-    - 不覆盖用户传入的已有 Cookie；唯一例外是 __ac_signature：nonce 本次被换新时，旧签名必然失配，必须重算；
+    - 不覆盖用户传入的已有 Cookie；
     - 获取 Cookie 和请求视频页/API 应尽量使用同一代理和 UA；
     - 所有网络请求都通过 yt-dlp 的 ie 实例发起。
     """
-    headers = headers or {}
-
-    base_headers = {
-        'Referer': DOUYIN_WEBPAGE_HOST,
-        'User-Agent': user_agent,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-        **headers,
-    }
-
     cookies = ie._get_cookies(DOUYIN_WEBPAGE_HOST)
-    # 记录进入时的 nonce：后续任何一次首页请求都可能下发新 nonce，据此判断签名是否需要重算
-    initial_ac_nonce = cookies.get('__ac_nonce')
-    initial_ac_nonce = initial_ac_nonce and initial_ac_nonce.value
-
     if not cookies.get('ttwid'):
         register_douyin_ttwid(ie, video_id, user_agent)
 
     cookies = ie._get_cookies(DOUYIN_WEBPAGE_HOST)
     if not cookies.get('ttwid'):
-        fetch_douyin_home_cookies(
-            ie,
-            video_id,
-            base_headers,
-            note='Fetching Douyin home cookies for ttwid')
+        fetch_douyin_home_cookies(ie, video_id, user_agent, note='Fetching Douyin home cookies for ttwid')
 
     cookies = ie._get_cookies(DOUYIN_WEBPAGE_HOST)
     if not cookies.get('s_v_web_id'):
         ie._set_cookie('.douyin.com', 's_v_web_id', generate_s_v_web_id())
-
-    cookies = ie._get_cookies(DOUYIN_WEBPAGE_HOST)
     if not cookies.get('msToken'):
         ie._set_cookie('.douyin.com', 'msToken', generate_ms_token())
 
+    ie.write_debug(
+        f'Douyin visitor cookies prepared: {cookie_state_debug(ie._get_cookies(DOUYIN_WEBPAGE_HOST))}')
+
+
+def ensure_douyin_ac_cookies(ie, video_id, user_agent):
+    """
+    准备页面方案（SSR RENDER_DATA）额外需要的 __ac_nonce / __ac_signature。
+
+    1. __ac_nonce
+        由 www.douyin.com 首页响应 Set-Cookie 下发，有效期 30 分钟（Max-Age=1800）。
+
+    2. __ac_signature
+        由 nonce 计算，二者一一绑定，失配时服务端返回「验证码中间页」。
+
+    签名比 nonce 活得久（本模块写入的不过期，浏览器写入的为 1 年），
+    --cookies-from-browser、跨次复用的 --cookies 文件、运行超过 30 分钟的批量任务都会出现
+    「新 nonce + 旧签名」。因此不看签名是否存在，而是校验它是否属于当前 nonce，
+    属于则保留（包括浏览器生成的签名），否则重算。
+    """
     cookies = ie._get_cookies(DOUYIN_WEBPAGE_HOST)
     if not cookies.get('__ac_nonce'):
-        fetch_douyin_home_cookies(
-            ie,
-            video_id,
-            base_headers,
-            note='Fetching Douyin __ac_nonce')
+        fetch_douyin_home_cookies(ie, video_id, user_agent, note='Fetching Douyin __ac_nonce')
+        cookies = ie._get_cookies(DOUYIN_WEBPAGE_HOST)
 
-    cookies = ie._get_cookies(DOUYIN_WEBPAGE_HOST)
     ac_nonce = cookies.get('__ac_nonce')
     ac_signature = cookies.get('__ac_signature')
 
-    # __ac_signature 与 __ac_nonce 一一绑定，失配时服务端返回「验证码中间页」。
-    # nonce 只有 30 分钟有效期（Max-Age=1800），签名却会长期残留（本模块写入的不过期，浏览器写入的为 1 年），
-    # 因此 --cookies-from-browser、跨次复用的 --cookies 文件、运行超过 30 分钟的批量任务，
-    # 都会出现「新 nonce + 旧签名」。只要 nonce 在本次调用中变了，就丢弃旧签名重算。
-    if ac_nonce and (not ac_signature or ac_nonce.value != initial_ac_nonce):
-        try:
-            signature = get_ac_signature(
-                'www.douyin.com',
-                ac_nonce.value,
-                user_agent)
-            if signature:
-                clear_douyin_cookie(ie, '__ac_signature')
-                ie._set_cookie('.douyin.com', '__ac_signature', signature)
-        except Exception as e:
-            ie.write_debug(f'Failed to generate Douyin __ac_signature: {e}')
+    if not ac_nonce:
+        ie.write_debug('Douyin __ac_nonce was not issued')
+    elif not (ac_signature and ac_signature_matches_nonce(ac_signature.value, ac_nonce.value)):
+        clear_douyin_cookie(ie, '__ac_signature')
+        ie._set_cookie(
+            '.douyin.com', '__ac_signature',
+            get_ac_signature(DOUYIN_AC_SIGNATURE_SITE, ac_nonce.value, user_agent))
 
     ie.write_debug(
-        f'Douyin cookies prepared: {cookie_state_debug(ie._get_cookies(DOUYIN_WEBPAGE_HOST))}')
+        f'Douyin __ac cookies prepared: {cookie_state_debug(ie._get_cookies(DOUYIN_WEBPAGE_HOST))}')

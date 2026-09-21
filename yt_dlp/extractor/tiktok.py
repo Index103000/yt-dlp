@@ -46,8 +46,8 @@ from .tiktok_utils.douyin.constants import (
     DOUYIN_USER_AGENT,
 )
 from .tiktok_utils.douyin.cookies import (
-    build_douyin_cookie_header,
-    ensure_douyin_cookies,
+    ensure_douyin_ac_cookies,
+    ensure_douyin_visitor_cookies,
 )
 from .tiktok_utils.douyin.render_data import (
     extract_render_data_json,
@@ -1653,21 +1653,6 @@ class DouyinIE(TikTokBaseIE):
     _UPLOADER_URL_FORMAT = 'https://www.douyin.com/user/%s'
     _WEBPAGE_HOST = 'https://www.douyin.com/'
 
-    # def _real_extract(self, url):
-    #     video_id = self._match_id(url)
-    #
-    #     detail = traverse_obj(self._download_json(
-    #         'https://www.douyin.com/aweme/v1/web/aweme/detail/', video_id,
-    #         'Downloading web detail JSON', 'Failed to download web detail JSON',
-    #         query={'aweme_id': video_id}, fatal=False), ('aweme_detail', {dict}))
-    #     if not detail:
-    #         # TODO: Run verification challenge code to generate signature cookies
-    #         raise ExtractorError(
-    #             'Fresh cookies (not necessarily logged in) are needed',
-    #             expected=not self._get_cookies(self._WEBPAGE_HOST).get('s_v_web_id'))
-    #
-    #     return self._parse_aweme_video_app(detail)
-
     def _real_extract(self, url):
         mobj = self._match_valid_url(url)
         video_id = mobj.group('id') or mobj.group('modal_id')
@@ -1693,7 +1678,7 @@ class DouyinIE(TikTokBaseIE):
         # 优点：
         # - API 空响应时还能从页面拿 videoDetail；
         # - modal_id 链路天然适配。
-        return self._extract_douyin_render_data(url, video_id)
+        return self._extract_douyin_render_data(video_id)
 
     def _extract_douyin_aweme_detail_api(self, video_id):
         """
@@ -1705,7 +1690,8 @@ class DouyinIE(TikTokBaseIE):
         """
         user_agent = DOUYIN_USER_AGENT
 
-        ensure_douyin_cookies(self, video_id, user_agent)
+        # API 只依赖访客 Cookie（实测只需 ttwid），__ac_nonce / __ac_signature 仅页面方案需要
+        ensure_douyin_visitor_cookies(self, video_id, user_agent)
 
         query = sign_aweme_detail_query(
             build_aweme_detail_query(video_id),
@@ -1730,31 +1716,29 @@ class DouyinIE(TikTokBaseIE):
 
         return detail
 
-    def _extract_douyin_render_data(self, url, video_id):
+    def _extract_douyin_render_data(self, video_id):
         """
         通过 Douyin SSR RENDER_DATA 获取 videoDetail。
         """
         user_agent = DOUYIN_USER_AGENT
-        request_headers = {
-            **DOUYIN_DEFAULT_WEB_HEADERS,
-            'User-Agent': user_agent,
-        }
 
-        ensure_douyin_cookies(self, video_id, user_agent, request_headers)
+        ensure_douyin_visitor_cookies(self, video_id, user_agent)
+        ensure_douyin_ac_cookies(self, video_id, user_agent)
 
-        jingxuan_url = make_jingxuan_url(video_id)
+        # 经测试，目前只有精选页 modal_id SSR 页面会在 RENDER_DATA 中返回 videoDetail，
+        # 所以无论原始 URL 是什么，都请求精选页
+        webpage_url = make_jingxuan_url(video_id)
+        webpage = self._download_webpage(
+            webpage_url,
+            video_id,
+            'Downloading Douyin video webpage',
+            headers={
+                **DOUYIN_DEFAULT_WEB_HEADERS,
+                'User-Agent': user_agent,
+            },
+            fatal=False)
 
-        urls_to_try = []
-        # 经测试，目前只看到 Douyin 精选页 modal_id SSR 页面可以通过 RENDER_DATA 返回 videoDetail，其他页面没有 视频信息
-        # if url != jingxuan_url:
-        #     urls_to_try.append(url)
-        urls_to_try.append(jingxuan_url)
-
-        for webpage_url in urls_to_try:
-            webpage = self._download_douyin_webpage(webpage_url, video_id, request_headers)
-            if not webpage:
-                continue
-
+        if webpage:
             render_data = extract_render_data_json(self, webpage, video_id)
             video_detail = extract_video_detail(render_data)
 
@@ -1769,28 +1753,6 @@ class DouyinIE(TikTokBaseIE):
             'Unable to extract Douyin video info. Try providing fresh Douyin cookies '
             'with --cookies-from-browser or --cookies',
             expected=True)
-
-    def _download_douyin_webpage(self, url, video_id, headers):
-        """
-        下载 Douyin 页面。
-
-        注意：
-        - 通过手动 Cookie Header 解决部分 cookie domain/path 匹配问题；
-        - 请求仍走 yt-dlp 自己的网络层，因此代理等参数继续生效。
-        """
-
-        cookie_header = build_douyin_cookie_header(
-            self._get_cookies(self._WEBPAGE_HOST))
-
-        return self._download_webpage(
-            url,
-            video_id,
-            'Downloading Douyin video webpage',
-            headers={
-                **headers,
-                **({'Cookie': cookie_header} if cookie_header else {}),
-            },
-            fatal=False)
 
     def _extract_douyin_web_formats(self, video_info):
         """
