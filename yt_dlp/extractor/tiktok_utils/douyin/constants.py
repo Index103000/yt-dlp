@@ -1,7 +1,6 @@
 # yt_dlp/extractor/tiktok_utils/douyin/constants.py
 from __future__ import annotations
 
-
 DOUYIN_WEBPAGE_HOST = 'https://www.douyin.com/'
 
 # __ac_signature 的 site 参数：浏览器传入的是去掉协议头的 location.href。

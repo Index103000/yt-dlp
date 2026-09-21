@@ -1,4 +1,4 @@
-# yt_dlp/extractor/tiktok/douyin/render_data.py
+# yt_dlp/extractor/tiktok_utils/douyin/render_data.py
 from __future__ import annotations
 
 import urllib.parse

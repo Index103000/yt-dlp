@@ -1,4 +1,4 @@
-# yt_dlp/extractor/tiktok/douyin/abogus.py
+# yt_dlp/extractor/tiktok_utils/douyin/abogus.py
 from __future__ import annotations
 
 from .abogus_python import generate_abogus_python

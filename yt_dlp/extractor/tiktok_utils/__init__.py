@@ -1,4 +1,4 @@
-# yt_dlp/extractor/tiktok/__init__.py
+# yt_dlp/extractor/tiktok_utils/__init__.py
 """
 TikTok / Douyin helper modules.
 
