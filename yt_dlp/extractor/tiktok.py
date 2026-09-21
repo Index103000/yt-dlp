@@ -1655,7 +1655,7 @@ class DouyinIE(TikTokBaseIE):
 
         # 依次尝试，每一级失败都打印具体原因，全部失败时汇总进最终报错：
         # 1. open API：open.douyin.com 来源的 aweme/detail，免签名、免 Cookie，海外 IP 也可用；
-        # 2. web API：www.douyin.com 来源 + a_bogus，只在国内 IP 可用（海外被 ArgusSecurityPlugin 拦截）；
+        # 2. web API：www.douyin.com 来源 + a_bogus，部分 IP 会被 ArgusSecurityPlugin 拦截（按 IP 而定，海外居多）；
         # 3. webpage：精选页 SSR RENDER_DATA + __ac_nonce / __ac_signature。
         failures = []
         for name, fetch_detail in (
@@ -1707,8 +1707,8 @@ class DouyinIE(TikTokBaseIE):
                 'User-Agent': user_agent,
                 'Referer': self._WEBPAGE_HOST,
             },
-            # 实测不带 a_bogus 或缺少 ttwid 时，服务端返回 200 + 空响应体
-            empty_body_hint='a_bogus or ttwid not accepted')
+            # 实测缺少 ttwid 时服务端返回 200 + 空响应体；a_bogus 目前不校验（不带或乱写都能通过）
+            empty_body_hint='ttwid missing or not accepted')
 
     def _call_douyin_detail_api(self, video_id, note, query, headers, empty_body_hint=None):
         """

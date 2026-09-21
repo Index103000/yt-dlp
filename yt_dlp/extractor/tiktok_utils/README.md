@@ -100,11 +100,12 @@ tiktok_utils/douyin/render_data.py
 
 1. **open API**：`aweme/v1/web/aweme/detail/`，`Origin` / `Referer` 为 `https://open.douyin.com`
     - 只需 `aweme_id` + `aid=6383`，不需要 `a_bogus`、Cookie，1 个请求完成；
-    - 不经过 Argus 的 uifid / 签名校验，海外 IP 与国内 IP 均可用；
+    - 决定放行的是 `Origin: https://open.douyin.com`（官方嵌入播放器的来源），服务端对它跳过 Argus 与 `ttwid` 要求，
+      海外 IP 与国内 IP 均可用；
     - 返回的 `aweme_detail` 与带 `a_bogus` 的 web API 一致，格式为其超集（多几档 540p H.265），最高画质相同。
 2. **web API**：同一接口，`www.douyin.com` 来源 + `a_bogus`
-    - Cookie 只需要访客 Cookie，实测只带 `ttwid` 即可；`a_bogus` 或 `ttwid` 不被接受时返回 200 + 空响应体；
-    - 海外 IP 被拦截：`403 Blocked by ArgusSecurityPlugin Uifid Not Found`，
+    - Cookie 只需要访客 Cookie，实测只带 `ttwid` 即可，缺失时返回 200 + 空响应体；`a_bogus` 目前不校验，保留以防重新校验；
+    - 部分 IP 会被拦截（按 IP 而定，海外居多，国内电信也遇到过）：`403 Blocked by ArgusSecurityPlugin Uifid Not Found`，
       补上 `uifid` query 参数后变为 `Signature Not Found`（还需要页面内 SDK 生成的 `x-secsdk-web-signature`）。
 3. **webpage**：精选页 `jingxuan?modal_id=` 的 SSR `RENDER_DATA`
     - 需要 `__ac_nonce` + `__ac_signature`，二者不匹配时服务端返回「验证码中间页」，缺失时返回 JS 挑战页；
