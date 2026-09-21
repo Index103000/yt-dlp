@@ -1,10 +1,9 @@
-# yt_dlp/extractor/tiktok/formats.py
+# yt_dlp/extractor/tiktok_utils/formats.py
 from __future__ import annotations
 
 import re
 
 from ...utils import (
-    ExtractorError,
     filter_dict,
     int_or_none,
 )
@@ -278,10 +277,8 @@ def parse_bytedance_video_extra(video_extra, parse_json_func=None):
     if not isinstance(video_extra, str) or not parse_json_func:
         return {}
 
-    try:
-        return parse_json_func(video_extra, None, fatal=False) or {}
-    except ExtractorError:
-        return {}
+    # fatal=False 时解析失败只报 warning 并返回 None，不会抛异常
+    return parse_json_func(video_extra, None, fatal=False) or {}
 
 
 def build_tiktok_bitrate_meta(bitrate_info, *, ratio=None, parse_json_func=None):

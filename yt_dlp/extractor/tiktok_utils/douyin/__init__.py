@@ -1,4 +1,4 @@
-# yt_dlp/extractor/tiktok/douyin/__init__.py
+# yt_dlp/extractor/tiktok_utils/douyin/__init__.py
 """
 Douyin-specific helper modules.
 

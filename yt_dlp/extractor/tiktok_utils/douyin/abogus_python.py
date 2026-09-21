@@ -1,4 +1,4 @@
-# yt_dlp/extractor/tiktok/douyin/abogus_python.py
+# yt_dlp/extractor/tiktok_utils/douyin/abogus_python.py
 from __future__ import annotations
 
 import random
@@ -79,7 +79,7 @@ class _ABogusPythonSigner:
             w.append(
                 (p1_input ^ cls._sm3_rotl(p1_input, 15) ^ cls._sm3_rotl(p1_input, 23))
                 ^ cls._sm3_rotl(w[j - 13], 7)
-                ^ w[j - 6]
+                ^ w[j - 6],
             )
 
         w_1 = [w[j] ^ w[j + 4] for j in range(64)]
@@ -214,7 +214,7 @@ class _ABogusPythonSigner:
             else:
                 n = ord(s[i]) << 16
 
-            for j, k in zip(range(18, -1, -6), (0xFC0000, 0x03F000, 0x0FC0, 0x3F)):
+            for j, k in zip(range(18, -1, -6), (0xFC0000, 0x03F000, 0x0FC0, 0x3F), strict=True):
                 if j == 6 and i + 1 >= len(s):
                     break
                 if j == 0 and i + 2 >= len(s):

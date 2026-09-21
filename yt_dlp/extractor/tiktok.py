@@ -11,31 +11,6 @@ import urllib.parse
 import uuid
 
 from .common import InfoExtractor
-from ..networking import HEADRequest
-from ..utils import (
-    ExtractorError,
-    UnsupportedError,
-    UserNotLive,
-    determine_ext,
-    extract_attributes,
-    filter_dict,
-    format_field,
-    int_or_none,
-    join_nonempty,
-    merge_dicts,
-    mimetype2ext,
-    parse_qs,
-    qualities,
-    srt_subtitles_timecode,
-    str_or_none,
-    truncate_string,
-    try_call,
-    try_get,
-    url_or_none,
-    urlencode_postdata,
-)
-from ..utils.traversal import find_element, require, traverse_obj
-
 from .tiktok_utils.douyin.api import (
     AWEME_DETAIL_API_URL,
     build_aweme_detail_query,
@@ -62,6 +37,31 @@ from .tiktok_utils.formats import (
     normalize_bytedance_vcodec,
     parse_bytedance_url_key,
 )
+from ..networking import HEADRequest
+from ..utils import (
+    ExtractorError,
+    UnsupportedError,
+    UserNotLive,
+    determine_ext,
+    extract_attributes,
+    filter_dict,
+    format_field,
+    int_or_none,
+    join_nonempty,
+    merge_dicts,
+    mimetype2ext,
+    parse_qs,
+    qualities,
+    srt_subtitles_timecode,
+    str_or_none,
+    truncate_string,
+    try_call,
+    try_get,
+    url_or_none,
+    urlencode_postdata,
+)
+from ..utils.traversal import find_element, require, traverse_obj
+
 
 class TikTokBaseIE(InfoExtractor):
     _UPLOADER_URL_FORMAT = 'https://www.tiktok.com/@%s'
@@ -420,7 +420,7 @@ class TikTokBaseIE(InfoExtractor):
         """
         Parse TikTok / Douyin UrlKey.
 
-        The actual implementation lives in tiktok/formats.py so that TikTok,
+        The actual implementation lives in tiktok_utils/formats.py so that TikTok,
         Douyin API and Douyin webpage extraction can share the same parser.
         """
         return parse_bytedance_url_key(url_key)
@@ -1758,7 +1758,7 @@ class DouyinIE(TikTokBaseIE):
         """
         解析 Douyin SSR RENDER_DATA videoDetail.video 结构中的 formats。
 
-        这里使用 tiktok/formats.py 中的通用增强解析：
+        这里使用 tiktok_utils/formats.py 中的通用增强解析：
         - 如果 bitRateList / playAddr 中存在 UrlKey，则统一解析；
         - width / height / filesize / fps 优先使用结构化字段；
         - UrlKey 主要补 format_id / vcodec / tbr / quality。

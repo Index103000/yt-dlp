@@ -1,4 +1,4 @@
-# yt_dlp/extractor/tiktok/douyin/tokens.py
+# yt_dlp/extractor/tiktok_utils/douyin/tokens.py
 from __future__ import annotations
 
 import random

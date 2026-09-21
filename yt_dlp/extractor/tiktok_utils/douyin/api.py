@@ -1,8 +1,7 @@
-# yt_dlp/extractor/tiktok/douyin/api.py
+# yt_dlp/extractor/tiktok_utils/douyin/api.py
 from __future__ import annotations
 
 from .abogus import generate_abogus
-
 
 AWEME_DETAIL_API_URL = 'https://www.douyin.com/aweme/v1/web/aweme/detail/'
 
