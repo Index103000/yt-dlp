@@ -680,6 +680,30 @@ class TikTokBaseIE(InfoExtractor):
         play_quality = traverse_obj(formats, (
             lambda _, v: play_width and v.get('width') == play_width, 'quality', any))
 
+        def fill_from_top_level(meta, *, filesize_field):
+            """
+            地址结构体缺字段时，用顶层 video 字段弱兜底；只用于 play / download，不覆盖 bitrateInfo 多档。
+
+            顶层字段描述的是 playAddr（实测 video.size 与 PlayAddrStruct.DataSize 一致），
+            对其他地址只是近似值，由调用方通过 filesize_field 决定写入 filesize 还是 filesize_approx。
+            """
+            if not meta.get('width') or not meta.get('height'):
+                meta.update(filter_dict({
+                    'width': play_width,
+                    'height': play_height,
+                }))
+
+            if not meta.get('filesize'):
+                meta[filesize_field] = int_or_none(video_info.get('size'))
+
+            if not meta.get('tbr'):
+                meta['tbr'] = int_or_none(video_info.get('bitrate'), scale=1000)
+
+            if not meta.get('vcodec'):
+                meta['vcodec'] = normalize_bytedance_vcodec(video_info.get('codecType'))
+
+            return meta
+
         # 2. 解析顶层 playAddr
         #
         # 不单独把 PlayAddrStruct.UrlList append 成新 format，避免和 bitrateInfo / playAddr 重复。
@@ -697,24 +721,8 @@ class TikTokBaseIE(InfoExtractor):
                 ratio=ratio,
                 allow_res_fallback=False)
 
-        # 2.3 PlayAddrStruct 没有宽高时，才使用顶层 video.width / video.height
-        # 顶层宽高只用于 play，不用于 bitrateInfo 多档。
-        if not play_meta.get('width') or not play_meta.get('height'):
-            play_meta.update(filter_dict({
-                'width': play_width,
-                'height': play_height,
-            }))
-
-        # 2.4 顶层 playAddr 没有 tbr / filesize 时，可用顶层字段弱兜底
-        # 注意：这只是 play 的弱兜底，不用于覆盖 bitrateInfo 多档。
-        if not play_meta.get('filesize'):
-            play_meta['filesize'] = int_or_none(video_info.get('size'))
-
-        if not play_meta.get('tbr'):
-            play_meta['tbr'] = int_or_none(video_info.get('bitrate'), scale=1000)
-
-        if not play_meta.get('vcodec'):
-            play_meta['vcodec'] = normalize_bytedance_vcodec(video_info.get('codecType'))
+        # 2.3 仍缺的宽高 / 大小 / 码率 / 编码用顶层字段兜底，它们描述的正是 playAddr
+        play_meta = fill_from_top_level(play_meta, filesize_field='filesize')
 
         if not play_meta.get('quality'):
             play_meta['quality'] = play_quality
@@ -751,26 +759,11 @@ class TikTokBaseIE(InfoExtractor):
             ratio=ratio,
             allow_res_fallback=False)
 
-        # DownloadAddrStruct 不存在时，使用顶层 video 字段弱兜底
-        # 这里不保证绝对准确，但比 list-formats unknown 更有参考价值。
-        if not download_meta.get('width') or not download_meta.get('height'):
-            download_meta.update(filter_dict({
-                'width': play_width,
-                'height': play_height,
-            }))
-
-        if not download_meta.get('filesize'):
-            download_meta['filesize'] = int_or_none(video_info.get('size'))
-
-        if not download_meta.get('tbr'):
-            download_meta['tbr'] = int_or_none(video_info.get('bitrate'), scale=1000)
-
-        if not download_meta.get('vcodec'):
-            download_meta['vcodec'] = normalize_bytedance_vcodec(video_info.get('codecType')) or 'h264'
-
-        download_meta['acodec'] = download_meta.get('acodec') or 'aac'
-
-        download_meta = filter_dict(download_meta)
+        # DownloadAddrStruct 不存在时，使用顶层 video 字段弱兜底。
+        # 这里不保证绝对准确，但比 list-formats unknown 更有参考价值；
+        # 顶层字段描述的是无水印的 playAddr，水印版大小并不相同（实测 665803 vs video.size 658136），
+        # 所以大小写入 filesize_approx。vcodec / acodec 缺失时由 COMMON_FORMAT_INFO 补 h264 / aac。
+        download_meta = filter_dict(fill_from_top_level(download_meta, filesize_field='filesize_approx'))
 
         for download_url in traverse_obj(video_info, (('downloadAddr', ('download', 'url')), {url_or_none})):
             formats.append({
