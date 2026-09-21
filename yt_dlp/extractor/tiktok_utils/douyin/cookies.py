@@ -147,6 +147,19 @@ def fetch_douyin_home_cookies(ie, video_id, headers, note='Fetching Douyin home 
         headers=headers)
 
 
+def clear_douyin_cookie(ie, name):
+    """
+    删除 cookiejar 中 douyin.com 及其子域下所有名为 name 的 Cookie。
+
+    浏览器导入的 Cookie 多为 host-only（www.douyin.com），本模块写入的是 .douyin.com；
+    只覆盖其中一个会导致请求里同名 Cookie 并存。
+    """
+    for cookie in list(ie.cookiejar):
+        domain = cookie.domain.lstrip('.')
+        if cookie.name == name and (domain == 'douyin.com' or domain.endswith('.douyin.com')):
+            ie.cookiejar.clear(cookie.domain, cookie.path, cookie.name)
+
+
 def ensure_douyin_cookies(ie, video_id, user_agent, headers=None):
     """
     准备 Douyin Web 匿名访问 Cookie。
@@ -168,7 +181,7 @@ def ensure_douyin_cookies(ie, video_id, user_agent, headers=None):
         基于 host + __ac_nonce + User-Agent 生成。
 
     注意：
-    - 不覆盖用户传入的已有 Cookie；
+    - 不覆盖用户传入的已有 Cookie；唯一例外是 __ac_signature：nonce 本次被换新时，旧签名必然失配，必须重算；
     - 获取 Cookie 和请求视频页/API 应尽量使用同一代理和 UA；
     - 所有网络请求都通过 yt-dlp 的 ie 实例发起。
     """
@@ -183,6 +196,9 @@ def ensure_douyin_cookies(ie, video_id, user_agent, headers=None):
     }
 
     cookies = ie._get_cookies(DOUYIN_WEBPAGE_HOST)
+    # 记录进入时的 nonce：后续任何一次首页请求都可能下发新 nonce，据此判断签名是否需要重算
+    initial_ac_nonce = cookies.get('__ac_nonce')
+    initial_ac_nonce = initial_ac_nonce and initial_ac_nonce.value
 
     if not cookies.get('ttwid'):
         register_douyin_ttwid(ie, video_id, user_agent)
@@ -215,13 +231,18 @@ def ensure_douyin_cookies(ie, video_id, user_agent, headers=None):
     ac_nonce = cookies.get('__ac_nonce')
     ac_signature = cookies.get('__ac_signature')
 
-    if ac_nonce and not ac_signature:
+    # __ac_signature 与 __ac_nonce 一一绑定，失配时服务端返回「验证码中间页」。
+    # nonce 只有 30 分钟有效期（Max-Age=1800），签名却会长期残留（本模块写入的不过期，浏览器写入的为 1 年），
+    # 因此 --cookies-from-browser、跨次复用的 --cookies 文件、运行超过 30 分钟的批量任务，
+    # 都会出现「新 nonce + 旧签名」。只要 nonce 在本次调用中变了，就丢弃旧签名重算。
+    if ac_nonce and (not ac_signature or ac_nonce.value != initial_ac_nonce):
         try:
             signature = get_ac_signature(
                 'www.douyin.com',
                 ac_nonce.value,
                 user_agent)
             if signature:
+                clear_douyin_cookie(ie, '__ac_signature')
                 ie._set_cookie('.douyin.com', '__ac_signature', signature)
         except Exception as e:
             ie.write_debug(f'Failed to generate Douyin __ac_signature: {e}')
