@@ -17,13 +17,13 @@ API 响应带 `filter_reason`（视频不存在等）时直接报错，不再尝
 | 策略 | 请求 | 依赖 | 海外 IP | 国内移动 | 国内电信 |
 | --- | --- | --- | --- | --- | --- |
 | 1. open API | `aweme/v1/web/aweme/detail/`，`Origin` / `Referer` 为 `https://open.douyin.com`，只带 `aweme_id` + `aid` | 无 | ✅ | ✅ | ✅ |
-| 2. web API | 同一接口，`www.douyin.com` 来源 + `a_bogus` | `ttwid` | ❌ 403 Argus | ✅ 10/10 | ❌ 5/5 403 Argus |
+| 2. web API | 同一接口，`www.douyin.com` 来源 + `a_bogus` | `ttwid` | ⚠️ 按 IP，巴西 5 个中 3 个 403 Argus | ✅ 10/10 | ❌ 5/5 403 Argus |
 | 3. webpage | 精选页 `jingxuan?modal_id=` 的 SSR `RENDER_DATA` | `__ac_nonce` + `__ac_signature` | ✅ | ✅ | ✅ |
 
-- 海外 IP：测试代理，出口为巴西住宅 IP，换过 4 个 IP。
+- 海外 IP：测试代理，出口为巴西住宅 IP，前后换过十几个 IP。
 - 国内移动：Mac mini，江苏移动家宽，抖音节点 `CHN-JSlianyungang-AREACMCC5`。
 - 国内电信：Windows 下载机，江苏徐州电信家宽，抖音节点 `CHN-JSlianyungang-CT5`。
-- 国内两列各只有一台机器的数据，「电信被拦」的原因尚未确定，见「5. 待验证」。
+- Argus 拦不拦按 IP 而定：同为巴西住宅 IP，有的被拦、有的不拦。国内两列各只有一台机器的数据，见「5. 待验证」。
 
 下载视频时，两个 API 策略的格式都必须带 `Referer`，见 2.4。
 
@@ -42,6 +42,9 @@ API 响应带 `filter_reason`（视频不存在等）时直接报错，不再尝
 | 不带 `uifid` query 参数 | `403 Blocked by ArgusSecurityPlugin Uifid Not Found` |
 | 带 `uifid` 参数（任意值，包括随机 320 位 hex、浏览器真实的 UIFID） | `403 Blocked by ArgusSecurityPlugin Signature Not Found` |
 | 只在 Cookie 里带 `UIFID`，不带 query 参数 | 仍是 `Uifid Not Found`，说明它看的是 query 参数 |
+
+拦不拦按客户端 IP 而定，不是「海外一律拦」：同一时间换 5 个巴西住宅 IP，3 个被拦（`Uifid Not Found`），
+另外 2 个上 web API 和不带签名的精简请求都正常返回。按什么判断（IP 信誉、ASN、概率）未知。
 
 `Signature Not Found` 缺的是 `x-secsdk-web-signature`（外部项目称为 webSign），只有真实抖音页面里的安全 SDK（JSVMP）能生成，
 生成顺序是先 `a_bogus` 再 webSign，输入包括完整 URL、时间戳、`uifid`（见 4. 参考项目中的 nous-app、amagi）。
@@ -70,11 +73,51 @@ Referer: https://open.douyin.com
 - 返回的 `aweme_detail` 与 web API 一致，解析出的格式是 web API 的超集（某视频多 8 档 540p H.265），最高画质相同；
 - 这是利用一个未被纳入校验的来源，随时可能被堵，所以 web API 和 webpage 两级保留作兜底。
 
+**为什么 open.douyin.com 不受限**
+
+open.douyin.com 是抖音开放平台，官方视频嵌入播放器 `https://open.douyin.com/player/video?vid=<id>` 就在这个域名下，
+第三方网站用 iframe 嵌入抖音视频时加载的就是它。在浏览器里打开该播放器，它自己发出的正是这个请求：
+
+```
+https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=<id>&aid=6383&msToken=&X-Bogus=DFSz...&_signature=_02B4Z6wo00001-...
+```
+
+参数只有 `aweme_id` + `aid`，签名是老一代的 `X-Bogus` 和 `_signature`（`_signature` 前缀为 `_02B4Z6wo00001`，
+与 `__ac_signature` 的 `_02B4Z6wo00f01` 相近，推测同源），`msToken` 为空，没有 `uifid`、webSign、`a_bogus`。
+服务端要让嵌入播放器在任何网站里都能用，就必须对「来自 open.douyin.com 的请求」放宽校验。
+
+决定放行的是 `Origin` 请求头，不是 `Referer`、参数或签名。实测（精简参数指只带 `aweme_id` + `aid`；国内直连与一个未被 Argus 拦截的海外 IP 结果相同；
+在被拦截的 IP 上，下表中非 open.douyin.com 来源的请求变为 `403 Uifid Not Found`，open.douyin.com 来源仍然成功）：
+
+| 请求头 | 参数 | 结果 | 响应 `Access-Control-Allow-Origin` |
+| --- | --- | --- | --- |
+| `Origin` + `Referer` 均为 open.douyin.com | 精简 | ✅ | `https://open.douyin.com` |
+| 只有 `Origin: https://open.douyin.com` | 精简 | ✅ | `https://open.douyin.com` |
+| `Origin` 为 open.douyin.com | 网页全套参数，带或不带 `a_bogus` | ✅ | `https://open.douyin.com` |
+| 只有 `Referer: https://open.douyin.com`（带不带路径都一样） | 精简 | 200 空 | 无 |
+| `Origin: https://www.douyin.com` | 精简 | 200 空（按网页规则，缺 `ttwid`） | `https://www.douyin.com` |
+| `Origin` / `Referer` 为 example.com | 精简 | 403（非白名单来源） | 无 |
+
+- 服务端对 `Origin` 做白名单：open.douyin.com 走开放平台的宽松策略（跳过 Argus 与 `ttwid` 要求），
+  www.douyin.com 走网页策略，其他来源直接 403；响应里的 `Access-Control-Allow-Origin` 证实了这个白名单。
+- 服务端敢信任 `Origin`，是因为浏览器里的页面脚本无法伪造它；非浏览器客户端可以随意设置，这就是可利用之处。
+- 如果将来对 open.douyin.com 来源也开始校验签名，嵌入播放器带的是 `X-Bogus` + `_signature`：
+  `X-Bogus` 在 f2 里有实现（`f2/utils/xbogus.py`，未验证是否仍可用），比 webSign 容易得多，可以优先考虑补上。
+
 ### 2.2 a_bogus 与访客 Cookie（web API）
 
-- web API 实测只依赖 `ttwid`：不带任何 Cookie 返回 200 空响应，只带 `ttwid` 即返回 `aweme_detail`；
+- web API 实测只依赖 `ttwid`，**`a_bogus` 目前不校验**（国内直连）：
+
+  | Cookie | 参数 | 结果 |
+  | --- | --- | --- |
+  | `ttwid` | 精简 / 网页全套，不带 `a_bogus` | ✅ |
+  | `ttwid` | 网页全套 + 乱写的 `a_bogus` | ✅ |
+  | `ttwid` | 网页全套 + 正确的 `a_bogus` | ✅ |
+  | 无 | 网页全套 + 正确的 `a_bogus` | 200 空 |
+  | 无 | 精简，不带 `a_bogus` | 200 空 |
+
+  所以 `HTTP 200 with empty body` 是缺 `ttwid` 造成的。仍然保留 `a_bogus`，以防服务端重新开始校验。
   `s_v_web_id`、`msToken` 由本地生成，保留是为了更像浏览器。
-- `a_bogus` 缺失或不被接受时同样是 200 空响应（`HTTP 200 with empty body`）。
 - `a_bogus` 按 query 字典插入顺序拼接签名，`build_aweme_detail_query` 不能随意重排字段。
 - 算法来源：上游 [yt-dlp#16182](https://github.com/yt-dlp/yt-dlp/pull/16182)（未合并，2026-03-10 关闭），
   PR 说明中 ABogus 移植自 [f2](https://github.com/Johnserf-Seed/f2)（Apache 2.0），SM3 移植自 gmssl。
@@ -189,8 +232,8 @@ User-Agent: com.ss.android.ugc.aweme/300904 (Linux; U; Android 12; zh_CN; SM-G97
 | 日志 | 含义 |
 | --- | --- |
 | `Douyin open API failed: HTTP 403: Blocked by ArgusSecurityPlugin ...` | open.douyin.com 来源也被纳入 Argus 校验，绕过方式失效 |
-| `Douyin web API failed: HTTP 403: Blocked by ArgusSecurityPlugin Uifid Not Found` | 当前网络下 web API 被 Argus 拦截（海外 IP、国内部分网络） |
-| `Douyin web API failed: HTTP 200 with empty body (a_bogus or ttwid not accepted)` | `a_bogus` 失效或 `ttwid` 缺失 |
+| `Douyin web API failed: HTTP 403: Blocked by ArgusSecurityPlugin Uifid Not Found` | 当前 IP 被 Argus 拦截（按 IP 而定，海外、国内都有） |
+| `Douyin web API failed: HTTP 200 with empty body (ttwid missing or not accepted)` | `ttwid` 缺失或无效（`a_bogus` 目前不校验） |
 | `Unable to obtain Douyin ttwid cookie` | ttwid 注册接口与首页都没下发 ttwid |
 | `Douyin video is unavailable (... filter_reason=...)` | 视频不存在 / 被过滤 |
 | `Unable to fetch Douyin home page for __ac_nonce: ...` | 首页请求失败（网络 / 代理） |
@@ -259,7 +302,8 @@ for i in range(5):
 
 ### 3.3 测试注意事项
 
-- 测试时优先走测试代理（出口多为巴西），避免本机 IP 被标记；但 web API 在海外必被拦，只能国内直连测。
+- 测试时优先走测试代理（出口多为巴西），避免本机 IP 被标记；web API 在代理 IP 上多半被拦（按 IP 而定），
+  要稳定测 web API 用国内直连（移动网络）。
   要单独测 web API 或页面方案，把前面的策略 monkeypatch 成失败：
   `DouyinIE._fetch_douyin_open_detail = lambda self, vid: (None, 'forced off')`。
 - 同一视频两次请求返回的格式数会波动（web API 69↔78、页面 12↔15、TikTok 的 audio 格式时有时无），
@@ -300,6 +344,8 @@ for i in range(5):
 1. **电信被拦的原因**：国内移动 10/10 通过、电信 5/5 被拦，各只有一台机器的数据。两种解释：
    - 按边缘节点或运营商分批开启 Argus；
    - 按 IP 信誉：电信那台是下载流水线机器，请求频繁，IP 可能被标记。
+
+   后来发现同为巴西住宅 IP 也是有的拦、有的不拦（2.1），更支持「按客户端 IP 判断」，但尚未排除节点因素。
 
    区分方法：在电信机器上 `nslookup www.douyin.com` 拿到它实际访问的节点 IP，
    从移动网络用 `curl --resolve www.douyin.com:443:<IP>` 把 web API 请求发到该节点（先确认 `via` 是 `CHN-...-CT5-...` 这类节点）。
