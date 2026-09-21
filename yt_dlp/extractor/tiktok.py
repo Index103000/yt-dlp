@@ -1681,7 +1681,11 @@ class DouyinIE(TikTokBaseIE):
         # - 当前测试对高分辨率更友好。
         detail = self._extract_douyin_aweme_detail_api(video_id)
         if detail:
-            return self._parse_aweme_video_app(detail)
+            info = self._parse_aweme_video_app(detail)
+            # 部分 douyinvod CDN 节点（如 v26-web）校验 Referer，缺失即 403（X-CCDN-FORBID-CODE: 020200）；
+            # aweme/v1/play 镜像也会跳转到这类节点。_parse_aweme_video_app 与 TikTok 共用，故在此补上。
+            info['http_headers'] = {'Referer': self._WEBPAGE_HOST}
+            return info
 
         # Strategy 2:
         #   SSR webpage RENDER_DATA + __ac_nonce + __ac_signature
@@ -1910,7 +1914,7 @@ class DouyinIE(TikTokBaseIE):
                 'duration': ('duration', {int_or_none}),
             })),
             **traverse_obj(video_detail, {
-                'title': (('itemTitle', 'desc'), {truncate_string(left=72)}, filter),
+                'title': (('itemTitle', 'desc'), {truncate_string(left=72)}, filter, any),
                 'description': ('desc', {str}),
                 'duration': ('video', 'duration', {lambda x: int_or_none(x, scale=1000)}, filter),
                 'timestamp': ('createTime', {int_or_none}),
