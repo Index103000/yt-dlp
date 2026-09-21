@@ -14,10 +14,13 @@ from .common import InfoExtractor
 from .tiktok_utils.douyin.api import (
     AWEME_DETAIL_API_URL,
     build_aweme_detail_query,
+    build_open_aweme_detail_query,
+    response_snippet,
     sign_aweme_detail_query,
 )
 from .tiktok_utils.douyin.constants import (
     DOUYIN_DEFAULT_WEB_HEADERS,
+    DOUYIN_OPEN_API_HEADERS,
     DOUYIN_USER_AGENT,
 )
 from .tiktok_utils.douyin.cookies import (
@@ -1650,68 +1653,106 @@ class DouyinIE(TikTokBaseIE):
         mobj = self._match_valid_url(url)
         video_id = mobj.group('id') or mobj.group('modal_id')
 
-        # Strategy 1:
-        #   aweme/detail Web API + a_bogus
-        #
-        # 优点：
-        # - 返回结构接近 App API；
-        # - 可以直接复用 _parse_aweme_video_app；
-        # - 当前测试对高分辨率更友好。
-        detail = self._extract_douyin_aweme_detail_api(video_id)
-        if detail:
-            info = self._parse_aweme_video_app(detail)
-            # 部分 douyinvod CDN 节点（如 v26-web）校验 Referer，缺失即 403（X-CCDN-FORBID-CODE: 020200）；
-            # aweme/v1/play 镜像也会跳转到这类节点。_parse_aweme_video_app 与 TikTok 共用，故在此补上。
-            info['http_headers'] = {'Referer': self._WEBPAGE_HOST}
+        # 依次尝试，每一级失败都打印具体原因，全部失败时汇总进最终报错：
+        # 1. open API：open.douyin.com 来源的 aweme/detail，免签名、免 Cookie，海外 IP 也可用；
+        # 2. web API：www.douyin.com 来源 + a_bogus，只在国内 IP 可用（海外被 ArgusSecurityPlugin 拦截）；
+        # 3. webpage：精选页 SSR RENDER_DATA + __ac_nonce / __ac_signature。
+        failures = []
+        for name, fetch_detail in (
+            ('open API', self._fetch_douyin_open_detail),
+            ('web API', self._fetch_douyin_web_detail),
+        ):
+            detail, reason = fetch_detail(video_id)
+            if detail:
+                info = self._parse_aweme_video_app(detail)
+                # 部分 douyinvod CDN 节点（如 v26-web）校验 Referer，缺失即 403（X-CCDN-FORBID-CODE: 020200）；
+                # aweme/v1/play 镜像也会跳转到这类节点。_parse_aweme_video_app 与 TikTok 共用，故在此补上。
+                info['http_headers'] = {'Referer': self._WEBPAGE_HOST}
+                return info
+            failures.append(f'{name}: {reason}')
+            self.report_warning(f'Douyin {name} failed: {reason}', video_id)
+
+        info, reason = self._extract_douyin_render_data(video_id)
+        if info:
             return info
+        failures.append(f'webpage: {reason}')
 
-        # Strategy 2:
-        #   SSR webpage RENDER_DATA + __ac_nonce + __ac_signature
-        #
-        # 优点：
-        # - API 空响应时还能从页面拿 videoDetail；
-        # - modal_id 链路天然适配。
-        return self._extract_douyin_render_data(video_id)
+        raise ExtractorError(
+            'Unable to extract Douyin video info. ' + '; '.join(failures), expected=True)
 
-    def _extract_douyin_aweme_detail_api(self, video_id):
+    def _fetch_douyin_open_detail(self, video_id):
         """
-        通过 Douyin aweme/detail Web API 获取 aweme_detail。
+        以 open.douyin.com 为来源请求 aweme/detail，不需要 a_bogus / Cookie。
+        """
+        return self._call_douyin_detail_api(
+            video_id,
+            'Downloading Douyin open API detail JSON',
+            build_open_aweme_detail_query(video_id),
+            DOUYIN_OPEN_API_HEADERS)
 
-        该方法 non-fatal：
-        - 失败时返回 None；
-        - 由 _real_extract 自动 fallback 到 RENDER_DATA 页面方案。
+    def _fetch_douyin_web_detail(self, video_id):
+        """
+        以 www.douyin.com 为来源、带 a_bogus 请求 aweme/detail。
         """
         user_agent = DOUYIN_USER_AGENT
 
-        # API 只依赖访客 Cookie（实测只需 ttwid），__ac_nonce / __ac_signature 仅页面方案需要
+        # 只依赖访客 Cookie（实测只需 ttwid），__ac_nonce / __ac_signature 仅页面方案需要
         ensure_douyin_visitor_cookies(self, video_id, user_agent)
 
-        query = sign_aweme_detail_query(
-            build_aweme_detail_query(video_id),
-            user_agent)
-
-        response = self._download_json(
-            AWEME_DETAIL_API_URL,
+        return self._call_douyin_detail_api(
             video_id,
-            'Downloading Douyin web detail JSON',
-            'Failed to download Douyin web detail JSON',
-            query=query,
-            headers={
+            'Downloading Douyin web API detail JSON',
+            sign_aweme_detail_query(build_aweme_detail_query(video_id), user_agent),
+            {
                 'User-Agent': user_agent,
                 'Referer': self._WEBPAGE_HOST,
             },
-            fatal=False)
+            # 实测不带 a_bogus 或缺少 ttwid 时，服务端返回 200 + 空响应体
+            empty_body_hint='a_bogus or ttwid not accepted')
 
-        detail = traverse_obj(response, ('aweme_detail', {dict}))
+    def _call_douyin_detail_api(self, video_id, note, query, headers, empty_body_hint=None):
+        """
+        请求 aweme/detail，返回 (aweme_detail, None) 或 (None, 失败原因)。
 
-        if not detail:
-            self.write_debug('Douyin aweme/detail API returned no aweme_detail')
+        失败原因保留服务端的原始信息，便于从日志判断是被拦截、签名无效还是视频本身不可用：
+        - 非 200：状态码 + 响应体，例如 HTTP 403: Blocked by ArgusSecurityPlugin Uifid Not Found；
+        - 200 空响应体 / 非 JSON；
+        - JSON 中没有 aweme_detail：附上 status_code 与 filter_detail（视频不存在时为 filter_reason=core_dep）。
+        """
+        try:
+            body, urlh = self._download_webpage_handle(
+                AWEME_DETAIL_API_URL, video_id, note,
+                query=query, headers=headers, expected_status=lambda _: True)
+        except ExtractorError as e:
+            return None, e.orig_msg
 
-        return detail
+        if urlh.status != 200:
+            return None, f'HTTP {urlh.status}: {response_snippet(body)}'
+
+        if not body.strip():
+            return None, join_nonempty(
+                f'HTTP {urlh.status} with empty body', empty_body_hint and f'({empty_body_hint})', delim=' ')
+
+        try:
+            data = json.loads(body)
+        except ValueError:
+            return None, f'non-JSON response: {response_snippet(body)}'
+
+        detail = traverse_obj(data, ('aweme_detail', {dict}))
+        if detail:
+            return detail, None
+
+        fields = {
+            'status_code': data.get('status_code'),
+            'status_msg': data.get('status_msg'),
+            **{k: v for k, v in (traverse_obj(data, ('filter_detail', {dict})) or {}).items() if k != 'aweme_id'},
+        }
+        return None, 'no aweme_detail in response ({})'.format(
+            ', '.join(f'{k}={v}' for k, v in fields.items() if v not in (None, '')))
 
     def _extract_douyin_render_data(self, video_id):
         """
-        通过 Douyin SSR RENDER_DATA 获取 videoDetail。
+        通过 Douyin SSR RENDER_DATA 获取 videoDetail，返回 (info, None) 或 (None, 失败原因)。
         """
         user_agent = DOUYIN_USER_AGENT
 
@@ -1721,31 +1762,38 @@ class DouyinIE(TikTokBaseIE):
         # 经测试，目前只有精选页 modal_id SSR 页面会在 RENDER_DATA 中返回 videoDetail，
         # 所以无论原始 URL 是什么，都请求精选页
         webpage_url = make_jingxuan_url(video_id)
-        webpage = self._download_webpage(
-            webpage_url,
-            video_id,
-            'Downloading Douyin video webpage',
-            headers={
-                **DOUYIN_DEFAULT_WEB_HEADERS,
-                'User-Agent': user_agent,
-            },
-            fatal=False)
+        try:
+            webpage, urlh = self._download_webpage_handle(
+                webpage_url,
+                video_id,
+                'Downloading Douyin video webpage',
+                headers={
+                    **DOUYIN_DEFAULT_WEB_HEADERS,
+                    'User-Agent': user_agent,
+                },
+                expected_status=lambda _: True)
+        except ExtractorError as e:
+            return None, e.orig_msg
 
-        if webpage:
-            render_data = extract_render_data_json(self, webpage, video_id)
-            video_detail = extract_video_detail(render_data)
+        render_data = extract_render_data_json(self, webpage, video_id)
+        video_detail = extract_video_detail(render_data)
 
-            self.write_debug(
-                f'Douyin RENDER_DATA extraction: url={webpage_url}, '
-                f'webpage_len={len(webpage)}, videoDetail={bool(video_detail)}')
+        self.write_debug(
+            f'Douyin RENDER_DATA extraction: url={webpage_url}, status={urlh.status}, '
+            f'webpage_len={len(webpage)}, RENDER_DATA={render_data is not None}, videoDetail={bool(video_detail)}')
 
-            if video_detail:
-                return self._parse_douyin_videodetail(video_detail, video_id, webpage_url)
+        if video_detail:
+            return self._parse_douyin_videodetail(video_detail, video_id, webpage_url), None
 
-        raise ExtractorError(
-            'Unable to extract Douyin video info. Try providing fresh Douyin cookies '
-            'with --cookies-from-browser or --cookies',
-            expected=True)
+        if urlh.status != 200:
+            return None, f'HTTP {urlh.status}: {response_snippet(webpage)}'
+        if 'byted_acrawler.sign' in webpage:
+            return None, 'got the anti-bot JS challenge page (__ac_nonce / __ac_signature not accepted)'
+        if '<title>验证码中间页</title>' in webpage:
+            return None, 'got the captcha page (验证码中间页)'
+        if render_data is None:
+            return None, f'RENDER_DATA not found in webpage (length {len(webpage)})'
+        return None, 'RENDER_DATA has no videoDetail (the video may not exist or be unavailable)'
 
     def _extract_douyin_web_formats(self, video_info):
         """
