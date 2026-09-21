@@ -29,7 +29,7 @@ tiktok_utils/formats.py
     - PlayAddr / bitrateInfo / bitRateList 元信息提取
 
 tiktok_utils/douyin/constants.py
-    Douyin 固定 UA、host、默认 headers、__ac_signature 的 site 参数
+    Douyin 固定 UA、host、默认 headers、open API 来源 headers、__ac_signature 的 site 参数
 
 tiktok_utils/douyin/abogus.py
     a_bogus 统一入口
@@ -59,8 +59,10 @@ tiktok_utils/douyin/cookies.py
 
 tiktok_utils/douyin/api.py
     Douyin API 查询参数构造：
-    - build_aweme_detail_query
+    - build_open_aweme_detail_query   open API（免签名）
+    - build_aweme_detail_query        web API
     - sign_aweme_detail_query
+    - response_snippet                失败原因日志用的响应体摘要
 
 tiktok_utils/douyin/render_data.py
     Douyin 页面方案：
@@ -82,20 +84,27 @@ tiktok_utils/douyin/render_data.py
 
 ------
 
-## DouyinIE 的两条链路
+## DouyinIE 的三级策略
 
-`DouyinIE._real_extract` 先走 API 方案，拿不到 `aweme_detail` 再回退页面方案。
+`DouyinIE._real_extract` 依次尝试，每一级失败都打印一条带原因的 WARNING
+（HTTP 状态码 + 响应体、空响应、`filter_detail` 等原始信息），全部失败时最终报错汇总三级原因。
 
-1. **API 方案**：`aweme/v1/web/aweme/detail/` + `a_bogus`
-    - Cookie 只需要访客 Cookie，实测只带 `ttwid` 即可，缺失则返回空响应；
-    - 海外 IP 会被拦截：`403 Blocked by ArgusSecurityPlugin Uifid Not Found`，
-      补上 `uifid` query 参数后变为 `Signature Not Found`，目前无法绕过，会自动回退页面方案；
-    - 格式的 `http_headers` 必须带 `Referer`，否则 douyinvod 的 v26-web 等节点返回 403。
-2. **页面方案**：精选页 `jingxuan?modal_id=` 的 SSR `RENDER_DATA`
-    - 需要 `__ac_nonce` + `__ac_signature`，二者不匹配时服务端返回「验证码中间页」；
+1. **open API**：`aweme/v1/web/aweme/detail/`，`Origin` / `Referer` 为 `https://open.douyin.com`
+    - 只需 `aweme_id` + `aid=6383`，不需要 `a_bogus`、Cookie，1 个请求完成；
+    - 不经过 Argus 的 uifid / 签名校验，海外 IP 与国内 IP 均可用；
+    - 返回的 `aweme_detail` 与带 `a_bogus` 的 web API 一致，格式为其超集（多几档 540p H.265），最高画质相同。
+2. **web API**：同一接口，`www.douyin.com` 来源 + `a_bogus`
+    - Cookie 只需要访客 Cookie，实测只带 `ttwid` 即可；`a_bogus` 或 `ttwid` 不被接受时返回 200 + 空响应体；
+    - 海外 IP 被拦截：`403 Blocked by ArgusSecurityPlugin Uifid Not Found`，
+      补上 `uifid` query 参数后变为 `Signature Not Found`（还需要页面内 SDK 生成的 `x-secsdk-web-signature`）。
+3. **webpage**：精选页 `jingxuan?modal_id=` 的 SSR `RENDER_DATA`
+    - 需要 `__ac_nonce` + `__ac_signature`，二者不匹配时服务端返回「验证码中间页」，缺失时返回 JS 挑战页；
     - 服务端对签名只校验 nonce 哈希和末 2 位校验位，不校验 UA、site、时间戳、环境常量；
     - nonce 有效期 30 分钟，签名却长期残留，所以 `ensure_douyin_ac_cookies` 按
       `ac_signature_matches_nonce` 判断是否重算，而不是看签名是否存在。
+
+两个 API 策略的格式都需要 `http_headers` 带 `Referer`，否则 douyinvod 的 v26-web 等节点返回 403。
+视频不存在时，两个 API 都返回 200 + `filter_detail.filter_reason=core_dep`，页面的 `videoDetail` 为 null。
 
 ------
 

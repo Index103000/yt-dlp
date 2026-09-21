@@ -6,6 +6,18 @@ from .abogus import generate_abogus
 AWEME_DETAIL_API_URL = 'https://www.douyin.com/aweme/v1/web/aweme/detail/'
 
 
+def build_open_aweme_detail_query(video_id):
+    """
+    构造以 open.douyin.com 为来源的 aweme/detail 参数。
+
+    配合 DOUYIN_OPEN_API_HEADERS 使用时只需要这两个参数，不需要 a_bogus / Cookie。
+    """
+    return {
+        'aweme_id': video_id,
+        'aid': '6383',
+    }
+
+
 def build_aweme_detail_query(video_id):
     """
     构造 Douyin aweme/detail Web API 参数。
@@ -41,6 +53,14 @@ def build_aweme_detail_query(video_id):
         'round_trip_time': '0',
         'aweme_id': video_id,
     }
+
+
+def response_snippet(text, limit=200):
+    """
+    把响应体压成一行并截断，用于失败原因日志。
+    """
+    text = ' '.join((text or '').split())
+    return text if len(text) <= limit else f'{text[:limit]}...'
 
 
 def sign_aweme_detail_query(query, user_agent):

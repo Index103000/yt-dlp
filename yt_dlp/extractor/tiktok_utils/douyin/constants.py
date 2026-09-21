@@ -14,6 +14,14 @@ DOUYIN_USER_AGENT = (
     'Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0'
 )
 
+# 以 open.douyin.com 为来源请求 www.douyin.com 的 aweme/detail：不经过 Argus 的 uifid / 签名校验，
+# 不需要 a_bogus 和 Cookie，海外 IP 也可用；返回的 aweme_detail 与带 a_bogus 的 Web API 一致（2026-09 实测）。
+DOUYIN_OPEN_API_HEADERS = {
+    'Origin': 'https://open.douyin.com',
+    'Referer': 'https://open.douyin.com',
+    'User-Agent': DOUYIN_USER_AGENT,
+}
+
 DOUYIN_DEFAULT_WEB_HEADERS = {
     'Referer': DOUYIN_WEBPAGE_HOST,
     'User-Agent': DOUYIN_USER_AGENT,

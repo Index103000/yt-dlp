@@ -80,7 +80,7 @@ def register_douyin_ttwid(ie, video_id, user_agent):
         ie.write_debug('Douyin ttwid was not found in Set-Cookie')
 
 
-def fetch_douyin_home_cookies(ie, video_id, user_agent, note='Fetching Douyin home cookies'):
+def fetch_douyin_home_cookies(ie, video_id, user_agent, purpose):
     """
     请求 Douyin 首页，让服务端下发基础 Cookie。
 
@@ -88,12 +88,14 @@ def fetch_douyin_home_cookies(ie, video_id, user_agent, note='Fetching Douyin ho
     - __ac_nonce
     - ttwid fallback
     - 其他服务端 Set-Cookie
+
+    请求失败时打印 warning（不中断），否则后续只会看到「拿到 JS 挑战页」之类的表象。
     """
     ie._download_webpage(
         DOUYIN_WEBPAGE_HOST,
         video_id,
-        note=note,
-        errnote=False,
+        note=f'Fetching Douyin home page for {purpose}',
+        errnote=f'Unable to fetch Douyin home page for {purpose}',
         fatal=False,
         headers={
             **DOUYIN_DEFAULT_WEB_HEADERS,
@@ -138,9 +140,11 @@ def ensure_douyin_visitor_cookies(ie, video_id, user_agent):
 
     cookies = ie._get_cookies(DOUYIN_WEBPAGE_HOST)
     if not cookies.get('ttwid'):
-        fetch_douyin_home_cookies(ie, video_id, user_agent, note='Fetching Douyin home cookies for ttwid')
+        fetch_douyin_home_cookies(ie, video_id, user_agent, 'ttwid')
 
     cookies = ie._get_cookies(DOUYIN_WEBPAGE_HOST)
+    if not cookies.get('ttwid'):
+        ie.report_warning('Unable to obtain Douyin ttwid cookie; web API will likely return an empty response', video_id)
     if not cookies.get('s_v_web_id'):
         ie._set_cookie('.douyin.com', 's_v_web_id', generate_s_v_web_id())
     if not cookies.get('msToken'):
@@ -167,14 +171,15 @@ def ensure_douyin_ac_cookies(ie, video_id, user_agent):
     """
     cookies = ie._get_cookies(DOUYIN_WEBPAGE_HOST)
     if not cookies.get('__ac_nonce'):
-        fetch_douyin_home_cookies(ie, video_id, user_agent, note='Fetching Douyin __ac_nonce')
+        fetch_douyin_home_cookies(ie, video_id, user_agent, '__ac_nonce')
         cookies = ie._get_cookies(DOUYIN_WEBPAGE_HOST)
 
     ac_nonce = cookies.get('__ac_nonce')
     ac_signature = cookies.get('__ac_signature')
 
     if not ac_nonce:
-        ie.write_debug('Douyin __ac_nonce was not issued')
+        ie.report_warning(
+            'Douyin home page did not issue __ac_nonce; webpage will likely get the anti-bot challenge page', video_id)
     elif not (ac_signature and ac_signature_matches_nonce(ac_signature.value, ac_nonce.value)):
         clear_douyin_cookie(ie, '__ac_signature')
         ie._set_cookie(
