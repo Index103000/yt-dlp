@@ -64,6 +64,7 @@ tiktok_utils/douyin/api.py
     - build_open_aweme_detail_query   open API（免签名）
     - build_aweme_detail_query        web API
     - sign_aweme_detail_query
+    - build_original_play_url         上传原片地址（/aweme/v1/play/?ratio=default）
     - response_snippet                失败原因日志用的响应体摘要
 
 tiktok_utils/douyin/render_data.py
@@ -106,7 +107,7 @@ tiktok_utils/douyin/render_data.py
 2. **web API**：同一接口，`www.douyin.com` 来源 + `a_bogus`
     - Cookie 只需要访客 Cookie，实测只带 `ttwid` 即可，缺失时返回 200 + 空响应体；`a_bogus` 目前不校验，保留以防重新校验；
     - 部分 IP 会被拦截（按 IP 而定，海外居多，国内电信也遇到过）：`403 Blocked by ArgusSecurityPlugin Uifid Not Found`，
-      补上 `uifid` query 参数后变为 `Signature Not Found`（还需要页面内 SDK 生成的 `x-secsdk-web-signature`）。
+      补上 `uifid` 后变为 `Signature Not Found`；带有效 `uifid` 并按纯算法生成 `x-secsdk-web-signature` 即可通过（实测，fork 尚未实现）。
 3. **webpage**：精选页 `jingxuan?modal_id=` 的 SSR `RENDER_DATA`
     - 需要 `__ac_nonce` + `__ac_signature`，二者不匹配时服务端返回「验证码中间页」，缺失时返回 JS 挑战页；
     - 服务端对签名只校验 nonce 哈希和末 2 位校验位，不校验 UA、site、时间戳、环境常量；
@@ -116,6 +117,10 @@ tiktok_utils/douyin/render_data.py
 两个 API 策略的格式都需要 `http_headers` 带 `Referer`，否则 douyinvod 的 v26-web 等节点返回 403。
 视频不存在时，两个 API 都返回 200 + `filter_detail.filter_reason=core_dep`，页面的 `videoDetail` 为 null；
 因此 API 响应带 `filter_reason` 时直接报错「Douyin video is unavailable」，不再尝试后续策略。
+
+三级策略都会额外列出上传原片 `original`（`/aweme/v1/play/?ratio=default`，未转码、码率约为最高转码档的 8 倍），
+不作为默认选择，用 `-f original` 选择。链接除 `/video/<id>`、`?modal_id=` 外，还支持 `iesdouyin.com` / `m.douyin.com`
+的 `/share/video/<id>` 与 `v.douyin.com` 短链；`webpage_url` 统一为 `https://www.douyin.com/video/<id>`。
 
 ------
 
