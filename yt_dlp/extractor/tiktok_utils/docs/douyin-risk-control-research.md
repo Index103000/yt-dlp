@@ -1,7 +1,8 @@
 # 抖音 / TikTok 风控调研记录
 
 - 调研时间：2026-09-21；2026-09-22 补充 Argus 签名实测、上传原片、短链与分享链接、与 media-parser 的对比，
-  同日实现 web API 签名（默认顺序改为 web → open → webpage）、原片探测，并调研 TikTok 原片
+  同日实现 web API 签名（改为第一级）、原片探测，并调研 TikTok 原片；当晚策略改名为 `signed_web_api` / `embed_origin_api` /
+  `ssr_render_data`，原片改为 `original=true` 时才列出、按分辨率排序并默认探测
 - 适用分支：`tiktok`
 - 对应代码：`yt_dlp/extractor/tiktok.py`（`DouyinIE`、`TikTokBaseIE._extract_web_formats`）、`yt_dlp/extractor/tiktok_utils/douyin/*`
 
@@ -12,25 +13,36 @@
 
 ## 1. 现状速览
 
-`DouyinIE._real_extract` 默认依次尝试 web → open → webpage 三级策略（`--extractor-args "douyin:strategies=..."` 可调整顺序或只用其中几条），
-除最后一级外每级失败都打印一条带原因的 WARNING，全部失败时最终报错汇总各级原因。
+`DouyinIE._real_extract` 默认依次尝试 `signed_web_api` → `embed_origin_api` → `ssr_render_data` 三级策略
+（`--extractor-args "douyin:strategies=..."` 可调整顺序或只用其中几条），
+除最后一级外每级失败都打印一条带原因的 WARNING（`Douyin <策略名> failed: <原因>`），全部失败时最终报错汇总各级原因。
 API 响应带 `filter_reason`（视频不存在等）时直接报错，不再尝试后续策略。
 
 | 策略 | 请求 | 依赖 | 海外 IP | 国内移动 | 国内电信 |
 | --- | --- | --- | --- | --- | --- |
-| 1. web API | `aweme/v1/web/aweme/detail/`，`www.douyin.com` 来源 + `a_bogus`；被 Argus 拦截时加 `uifid` + `x-secsdk-web-signature` | `ttwid`；拦截时要有效 `uifid` | ✅（拦截 IP 靠签名，2.1） | ✅ 不签名即可 | ✅ 靠签名（2026-09-22 实测：未签名被拦 → 精选页取 `UIFID_TEMP` → 签名 200）；未签名时 5/5 被拦 |
-| 2. open API | 同一接口，`Origin` 为 `https://open.douyin.com`，只带 `aweme_id` + `aid` | 无 | ✅ | ✅ | ✅ |
-| 3. webpage | 精选页 `jingxuan?modal_id=` 的 SSR `RENDER_DATA` | `__ac_nonce` + `__ac_signature` | ✅ | ✅ | ✅ |
+| 1. `signed_web_api` | `aweme/v1/web/aweme/detail/`，`www.douyin.com` 来源 + `a_bogus`；被 Argus 拦截时加 `uifid` + `x-secsdk-web-signature` | `ttwid`；拦截时要有效 `uifid` | ✅（拦截 IP 靠签名，2.1） | ✅ 不签名即可 | ✅ 靠签名（2026-09-22 实测：未签名被拦 → 精选页取 `UIFID_TEMP` → 签名 200）；未签名时 5/5 被拦 |
+| 2. `embed_origin_api` | 同一接口，`Origin` 为 `https://open.douyin.com`，只带 `aweme_id` + `aid` | 无 | ✅ | ✅ | ✅ |
+| 3. `ssr_render_data` | 精选页 `jingxuan?modal_id=` 服务端渲染（SSR）的 `RENDER_DATA` | `__ac_nonce` + `__ac_signature` | ✅ | ✅ | ✅ |
 
-web API 排第一，是因为 open API 利用的是官方嵌入播放器的 `Origin` 白名单（2.1），随时可能被堵；web API 走的是网页正常接口，
-被拦截时按服务端的真实校验规则签名，不依赖这个口子。代价是在拦截 IP 上第一个视频要 5 个请求（2.1），open API 只要 1 个。
+`signed_web_api` 排第一，是因为 `embed_origin_api` 利用的是官方嵌入播放器的 `Origin` 白名单（2.1），随时可能被堵；
+`signed_web_api` 走的是网页正常接口，被拦截时按服务端的真实校验规则签名，不依赖这个口子。
+代价是在拦截 IP 上第一个视频要 5 个请求（2.1），`embed_origin_api` 只要 1 个。
+
+下文的叫法与策略名的对应：「web API」= `signed_web_api` 请求的网页端接口；正文里的 `embed_origin_api` 即 2.1「绕过方式：open.douyin.com 来源」；
+「SSR 方案」= `ssr_render_data`；「精选页」指 `jingxuan?modal_id=` 页面本身，`ssr_render_data` 从它取 `RENDER_DATA`，
+`signed_web_api` 被拦截时也从它取 `UIFID_TEMP`（同一次提取只请求一次）。
+这三个策略在 2026-09-22 下午引入 `strategies` 参数时（提交 `ad9830bda`）叫 `web` / `open` / `webpage`，当晚改为现名，旧名现在会报错。
 
 extractor-args（`--extractor-args "douyin:<键>=<值>"`）：
 
 | 键 | 取值 | 作用 |
 | --- | --- | --- |
-| `strategies` | `web`、`open`、`webpage` 的有序组合，默认 `web,open,webpage` | 调整顺序或只用其中几条；空值按默认，重复会去重，未知名字报错 |
-| `original_probe` | `none`（默认）/ `size` / `full` | 下载前探测上传原片，见 2.9 |
+| `strategies` | `signed_web_api`、`embed_origin_api`、`ssr_render_data` 的有序组合，默认三者按此顺序 | 调整顺序或只用其中几条；空值按默认，重复会去重，未知名字（含旧名）报错 |
+| `original` | `false`（默认）/ `true` | 列出上传原片 `original`：按分辨率归档、排在同档转码档之上，因此成为默认选择，见 2.9 |
+| `original_probe` | `true`（默认）/ `false` | 列出原片时先探测，补全编码、大小、容器并去掉「假原片」；关闭后若输出 info JSON（`--write-info-json` / `-j` / `-J`）会警告信息不全 |
+
+Python API 里每个值都要写成字符串列表，如 `{'douyin': {'original': ['true']}}`；写成字符串会报错（yt-dlp 会把字符串拆成单个字符）。
+值不区分大小写。
 
 - 海外 IP：测试代理，出口为巴西住宅 IP，前后换过十几个 IP。
 - 国内移动：Mac mini，江苏移动家宽，抖音节点 `CHN-JSlianyungang-AREACMCC5`。
@@ -41,7 +53,7 @@ extractor-args（`--extractor-args "douyin:<键>=<值>"`）：
 
 - 支持的链接：`www.douyin.com/video/<id>`、任意路径上的 `?modal_id=<id>`、`iesdouyin.com` / `m.douyin.com` 的 `/share/video/<id>`、
   `v.douyin.com/<code>` 短链（见 2.10）。图集、音乐、合集等不支持。`webpage_url` 统一为 `https://www.douyin.com/video/<id>`。
-- 除转码档外，额外列出上传原片 `original`（不作为默认，`-f original` 选择），见 2.9。
+- `original=true` 时额外列出上传原片 `original` 并默认选中它，见 2.9。
 - 另有 App feed 接口也能绕开 Argus，但实测最高只有 720p，未接入，见 2.8。
 
 ------
@@ -103,7 +115,7 @@ extractor-args（`--extractor-args "douyin:<键>=<值>"`）：
 - 按 403 原文处理：`Uifid Not Found`（没有 uifid）→ 从精选页取 `UIFID_TEMP` 后签名重试；`Validate Error` → 该值记为无效，
   `UIFID_TEMP` / 缓存里的同值一并作废，换下一个候选值，候选用尽再从精选页取（取之前清掉 `UIFID_TEMP` 与已判无效的 `UIFID`，
   否则服务端不下发）；`Sign Invalid` / `Signature Not Found` / 空响应等不重试。每个候选值最多试一次、页面最多请求一次，必然终止。
-- 精选页（`_download_douyin_webpage`）：本次提取内只请求一次，成功的响应留给页面方案复用；网络失败不缓存；
+- 精选页（`_download_douyin_webpage`）：本次提取内只请求一次，成功的响应留给 SSR 方案复用；网络失败不缓存；
   返回挑战页且下发了新 `__ac_nonce` 时，重算 `__ac_signature` 再请求一次；页面新下发的 `UIFID_TEMP` 写入缓存。
 - 请求数（实测）：拦截 IP、空缓存、无 Cookie 的第一个视频 5 个（ttwid 注册、不签名 403、首页取 `__ac_nonce`、精选页、签名 200）；
   同一批次后续视频 1 个（签名）；新进程用缓存 2 个（ttwid、签名）；未拦截 IP 2 个（ttwid、不签名 200）。
@@ -178,7 +190,7 @@ https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=<id>&aid=6383&msToken
   PR 说明中 ABogus 移植自 [f2](https://github.com/Johnserf-Seed/f2)（Apache 2.0），SM3 移植自 gmssl。
 - 回归测试：`a_bogus` 依赖随机数和当前时间，固定 `random.seed` 并 mock `time.time` 后对比输出。
 
-### 2.3 __ac_nonce / __ac_signature（byted_acrawler，页面方案）
+### 2.3 __ac_nonce / __ac_signature（byted_acrawler，SSR 方案）
 
 流程：
 
@@ -232,7 +244,7 @@ https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=<id>&aid=6383&msToken
 ### 2.5 视频不存在 / 被过滤
 
 - 两个 API 都返回 `200`，`aweme_detail` 为 null，附 `filter_detail`：`{"filter_reason": "core_dep", "detail_msg": "", "notice": "", ...}`；
-- 页面方案有 `RENDER_DATA`，但 `app.videoDetail` 为 null；
+- SSR 方案有 `RENDER_DATA`，但 `app.videoDetail` 为 null；
 - 所以 API 响应带 `filter_reason` 就直接报错 `Douyin video is unavailable (status_code=0, filter_reason=core_dep)`。
 - iesdouyin 分享页（2.11）对不存在的作品返回 `item_list=[]`，`filter_list[0].filter_reason='SYSTEM_ITEM_NOT_EXIST'`。
 - 实测到的另一个取值：`music_deleted_video`（6950251282489675042）；另有一个视频（7422307345595731236）经巴西代理返回
@@ -240,12 +252,12 @@ https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=<id>&aid=6383&msToken
 - 其他 `filter_reason`（已删除、私密、地区限制等）尚未遇到实例；media-parser 的注释和文档提到
   `status_self_see`、`status_deleted`、`status_part_see`，但其仓库里没有样本，未核实。
 
-### 2.6 页面方案的页面特征
+### 2.6 SSR 方案的页面特征
 
 - 只有精选页 `https://www.douyin.com/jingxuan?modal_id=<id>` 的 SSR 在 `RENDER_DATA` 中返回 `app.videoDetail`，其他页面没有；
 - JS 挑战页：含 `byted_acrawler.sign`；
 - 验证码中间页：`<title>验证码中间页</title>`，约 6KB；
-- 页面方案每档码率只取第一个镜像（镜像多了 yt-dlp 也不会自动换，没有实际好处）。
+- SSR 方案每档码率只取第一个镜像（镜像多了 yt-dlp 也不会自动换，没有实际好处）。
 
 ### 2.7 TikTok
 
@@ -288,7 +300,7 @@ User-Agent: com.ss.android.ugc.aweme/300904 (Linux; U; Android 12; zh_CN; SM-G97
 
 实测（2026-09-21，国内移动直连，两个域名结果相同）：
 
-| 视频 | 返回 | 目标位置 | `bit_rate` 档数 | 最高画质 | open API 对照 |
+| 视频 | 返回 | 目标位置 | `bit_rate` 档数 | 最高画质 | embed_origin_api 对照 |
 | --- | --- | --- | --- | --- | --- |
 | 7686096925641338809 | 7 个视频 | 第 1 个 | 7 | 1280x720 | 29 档，最高 2560x1440 |
 | 6961737553342991651（老视频） | 7 个视频 | 第 1 个 | 2 | 720x1280 | — |
@@ -299,16 +311,16 @@ User-Agent: com.ss.android.ugc.aweme/300904 (Linux; U; Android 12; zh_CN; SM-G97
   （809 为 8.5MB）；feed 自带的 `play_addr_h264` 更低（809 为 1024x576）；
 - `video.width/height` 写着 2560x1440，但 feed 不提供 1080p 以上的转码档；
 - 耗时 2.2–2.4 秒（media-parser 文档称约 200ms），离它设置的 4 秒超时只剩不到 2 秒；
-- `play_addr.uri` 与 open API 相同（8/8），所以 2.9 的 `ratio=default` 原片 feed 也能拿到，但 web API、open API、页面方案同样能，feed 没有独有优势。
+- `play_addr.uri` 与 embed_origin_api 相同（8/8），所以 2.9 的 `ratio=default` 原片 feed 也能拿到，但 web API、embed_origin_api、SSR 方案同样能，feed 没有独有优势。
 
 限制：
 
-- **画质最高 720p**，档位也少得多，远不如 open API 和页面方案（都能拿到 2K）；
+- **画质最高 720p**，档位也少得多，远不如 embed_origin_api 和 SSR 方案（都能拿到 2K）；
 - App 协议的多数接口要求 `X-Gorgon` / `X-Argus` 等签名，这个接口目前不查，随时可能补上；
 - 图集类作品不支持（media-parser 让图集改走网页接口）；
 - 未在海外、电信网络下测过。
 
-所以它只适合做最后兜底，排在页面方案之后。
+所以它只适合做最后兜底，排在 SSR 方案之后。
 
 ### 2.9 上传原片 ratio=default（已接入为 original 格式）
 
@@ -320,7 +332,7 @@ User-Agent: com.ss.android.ugc.aweme/300904 (Linux; U; Android 12; zh_CN; SM-G97
 | `default` | **上传原片**，未经转码；原片已被清理的老视频会悄悄返回最高转码档（见下） |
 
 原片是否最好（2026-09-22，17 个可用视频 + 复核补测 4K；`uri` 取 `aweme_detail.video.play_addr.uri` 或 RENDER_DATA `videoDetail.video.uri`，
-与 App feed、iesdouyin 分享页给出的也相同，所以原片不依赖 open API）：
+与 App feed、iesdouyin 分享页给出的也相同，所以原片不依赖 embed_origin_api）：
 
 - 16/17 是真正的上传原片：显示分辨率与 fps 都不低于任何转码档（2 个 2021 年老视频的原片分辨率严格更高），
   平均码率是码率最高转码档的 2.8–10.3 倍（中位数约 6.15）；没有发现转码档分辨率或 fps 高于原片（没看到超分 / 插帧档）。
@@ -341,17 +353,28 @@ User-Agent: com.ss.android.ugc.aweme/300904 (Linux; U; Android 12; zh_CN; SM-G97
 覆盖掉 info 级 Referer（yt-dlp 的 `_calc_headers(ChainMap(fmt, info))` 以格式级为准，`--load-info-json` 与外部下载器同样生效；
 用户显式 `--referer` / `--add-headers` 仍会加上）。
 
-**实现**（`DouyinIE._add_douyin_original_format`、`_probe_douyin_original`、`tiktok_utils/douyin/mp4probe.py`）：
+**实现**（`DouyinIE._add_douyin_original_format`、`_douyin_original_quality`、`_probe_douyin_original`、`tiktok_utils/douyin/mp4probe.py`）：
 
-- `format_id='original'`，默认宽高取 `video.width/height`、ext 为 mp4、编码与大小未知；`quality=0` 且 `preference` 与所在路径的转码档持平
-  （API 为 -1，页面方案为 -2），因此默认选择仍是最高转码档，`-f worst` 仍是水印版 download，只有 `-f original`（或用户 `-S size` 等）会选中它。
-- `--extractor-args "douyin:original_probe=size"`：对原片发 1 个 `Range: bytes=0-4095`（跟随 302，约 2 个 HTTP 请求），
-  得到精确 `filesize`、`tbr`（大小 × 8 / 时长）、`ext`（brand 为 `qt` 时 `mov`）；跳转后的对象 ID 与某转码档相同、或大小等于某档 `data_size`
-  即判为回退，直接去掉 original。`full` 再加 1 个 Range 取文件尾的 moov，纯 Python 解析出 `vcodec`、`acodec`、`fps`（平均帧率）、`vbr`、`abr`、
-  `dynamic_range`（colr 的 transfer：16 为 HDR10、18 为 HLG；没有 colr 时不下结论）与显示宽高。服务器不支持 Range 时不做 moov 探测。
-- 探测代价：国内直连 size 0.2–0.5s、full 0.2–0.6s；海外代理 10–20s。默认 `none`，不增加请求。探测任何失败都保留未探测的原片格式。
-- 已知限制：`none` 时用户用 `-S res` / `-S size` 可能选中回退的「假原片」，需要按分辨率或体积排序时请配合 `original_probe=size`；
-  `none` 时 QuickTime 原片会存成 `.mp4`。
+- 默认不列出；`--extractor-args "douyin:original=true"` 时列出 `format_id='original'`，宽高先取 `video.width/height`、ext 为 mp4。
+- 排序：`preference` 与转码档相同（-1）；`quality` 按分辨率归档，取「短边不超过原片的转码档」里最大的 `quality` 再加 0.5
+  （转码档的 `quality` 来自 UrlKey 档位名，如 540p → 540；档位名不一定等于实际短边，1024x576 标 540p、320x240 标 360p，所以按实际宽高归档）。
+  于是原片排在同分辨率转码档之上、更高档位之下，默认选择就是它（真原片分辨率不低于任何转码档，实际总在最前）；
+  `-S` 等用户排序规则排在 `quality` 之前，同样作用于原片；`-f worst` 仍是水印版 download。
+  SSR 方案的 `bitRateList` 没有 UrlKey，转码档的 `quality` 按实际短边补上（与 yt-dlp 的 `res` 同值，转码档之间的顺序不变），原片同样按档位归档。
+  归档比较留 16px 余量，免得奇数边取整或探测宽高有 1–2px 出入时掉一整档。
+- 探测（`original_probe`，默认开）：先发 1 个 `Range: bytes=0-4095`（跟随 302，约 2 个 HTTP 请求），得到精确 `filesize`、
+  `tbr`（大小 × 8 / 时长）、`ext`（brand 为 `qt` 时 `mov`）；跳转后的对象 ID 与某转码档相同、或大小等于某档 `data_size` 即判为回退，
+  去掉 original（打印 `The original upload is no longer available ...`）。再发 1 个 Range 取文件尾的 moov，纯 Python 解析出
+  `vcodec`、`acodec`、`fps`（平均帧率）、`vbr`、`abr`、`dynamic_range`（colr 的 transfer：16 为 HDR10、18 为 HLG；没有 colr 时不下结论）与显示宽高。
+- 探测代价（直连 6 个视频、海外代理 3 个）：国内直连整体 0.18–0.61s（旧 `size` 模式只取文件头为 0.17–0.45s）；
+  海外代理 9.8–20.0s，大头在第一个请求（302 + CDN 首包，8.2–16.9s），moov 一步只占 1.1–1.9s（复用连接）。
+  moov 在 ≤90 秒的样本里为 7–116KB，20 分钟的视频为 1.2MB。两步差别很小，所以不再分 `size` / `full` 两档，开探测就读全。
+- 探测失败：第一个请求失败时保留未探测的原片，但 `quality` 降为 0（转码档之下），不作为默认选择，需要时 `-f original`；
+  moov 一步失败时保留第一步的结果。两种情况都打印 WARNING，因为 info JSON 里原片的编码等信息会缺。
+- `original_probe=false`：不多发请求，但编码、大小、容器未知，识别不了「假原片」，QuickTime 原片会存成 `.mp4`，
+  `-S vcodec` / `-S size` 等规则对原片无效；此时若输出 info JSON（`--write-info-json` / `-j` / `-J`；`--embed-info-json` 不在检查范围内），
+  整次运行打印一次 WARNING（设置了自定义 logger 时 yt-dlp 不去重，每个视频一次）。
+  另外 `best[vcodec!=none]` 这类筛选会排除编码未知的原片（格式筛选里未知值不满足 `!=`，要写 `vcodec!=?none` 才放行）。
 - 修正记录：最初 `preference=-2` 使 API 路径的 `-f worst` 选中体积最大的原片；最初未排除图文作品（其 `play_addr.uri` 是配乐 mp3 的完整 URL），
   拼出无效地址并被默认选中；最初继承了 info 级 Referer，调度到 `v96-hcc` 时下载 403。均已修正。
 
@@ -378,7 +401,7 @@ User-Agent: com.ss.android.ugc.aweme/300904 (Linux; U; Android 12; zh_CN; SM-G97
 - 数据少：`bit_rate` 为 null、没有 `download_addr`，`play_addr` 只有一条 `playwm ... ratio=720p`（H.264 1280x720，抽帧未见抖音 logo）；
   但带着 `uri`，可以用 2.9 的 `ratio=default` 拿原片；
 - 响应里有 `is_oversea` 字段（国内为 0），海外表现未测；
-- 结论：门槛比精选页低（免 `__ac`），数据比精选页少（没有码率阶梯），可作为页面方案失效时的备选。
+- 结论：门槛比精选页低（免 `__ac`），数据比精选页少（没有码率阶梯），可作为 SSR 方案失效时的备选。
 
 ------
 
@@ -388,23 +411,26 @@ User-Agent: com.ss.android.ugc.aweme/300904 (Linux; U; Android 12; zh_CN; SM-G97
 
 | 日志 | 含义 |
 | --- | --- |
-| `Douyin open API failed: HTTP 403: Blocked by ArgusSecurityPlugin ...` | open.douyin.com 来源也被纳入 Argus 校验，绕过方式失效 |
-| `Douyin web API failed: HTTP 403: ... Uifid Not Found; unable to obtain a usable UIFID_TEMP from the webpage` | 当前 IP 被 Argus 拦截，且精选页没下发 `UIFID_TEMP`（多半拿到了挑战页 / 验证码页，`-v` 里有 `Douyin webpage did not issue a usable UIFID_TEMP: <原因>`）；可用 `--cookies-from-browser` 带入浏览器的 `UIFID` |
-| `Douyin web API failed: HTTP 403: ... Validate Error; the UIFID_TEMP issued by the webpage was rejected as well` | 连页面刚下发的 `UIFID_TEMP` 也被判无效：uifid 的校验规则变了 |
-| `Douyin web API failed: HTTP 403: ... Sign Invalid` | uifid 有效但签名不对：webSign 的盐或规范化规则变了，对照 DouYin_Spider 更新 `websign.py` |
-| `Douyin web API failed: HTTP 403: ... Signature Not Found` | 带了 uifid 却没收到签名：检查 URL 是否被改写、签名参数名是否变了 |
-| `Douyin web API failed: HTTP 403: Blocked by ArgusSecurityPlugin Uifid Not Found` | 当前 IP 被 Argus 拦截（按 IP 而定，海外、国内都有）。未签名时会自动取 `UIFID_TEMP` 签名重试，不会停在这一步；停在这里说明签名请求也报它，即服务端不再从 query 读 `uifid` |
-| `Douyin web API failed: HTTP 200 with empty body (ttwid missing or not accepted)` | `ttwid` 缺失或无效（`a_bogus` 目前不校验） |
-| `[debug] Douyin web API: signing with uifid from <来源>` / `uifid from <来源> was rejected (...)` | 签名用的 uifid 来自 `cookie UIFID` / `cookie UIFID_TEMP` / `cache` / `webpage UIFID_TEMP`；被判无效的会自动换下一个 |
+| `Douyin embed_origin_api failed: HTTP 403: Blocked by ArgusSecurityPlugin ...` | open.douyin.com 来源也被纳入 Argus 校验，绕过方式失效 |
+| `Douyin signed_web_api failed: HTTP 403: ... Uifid Not Found; unable to obtain a usable UIFID_TEMP from the webpage (<原因>)` | 当前 IP 被 Argus 拦截，且精选页没下发 `UIFID_TEMP`；括号里是页面失败原因（网络错误、挑战页 / 验证码页特征等）；可用 `--cookies-from-browser` 带入浏览器的 `UIFID` |
+| `Douyin signed_web_api failed: HTTP 403: ... Validate Error; the UIFID_TEMP issued by the webpage was rejected as well` | 连页面刚下发的 `UIFID_TEMP` 也被判无效：uifid 的校验规则变了 |
+| `Douyin signed_web_api failed: HTTP 403: ... Sign Invalid` | uifid 有效但签名不对：webSign 的盐或规范化规则变了，对照 DouYin_Spider 更新 `websign.py` |
+| `Douyin signed_web_api failed: HTTP 403: ... Signature Not Found` | 带了 uifid 却没收到签名：检查 URL 是否被改写、签名参数名是否变了 |
+| `Douyin signed_web_api failed: HTTP 403: Blocked by ArgusSecurityPlugin Uifid Not Found` | 当前 IP 被 Argus 拦截（按 IP 而定，海外、国内都有）。未签名时会自动取 `UIFID_TEMP` 签名重试，不会停在这一步；停在这里说明签名请求也报它，即服务端不再从 query 读 `uifid` |
+| `Douyin signed_web_api failed: HTTP 200 with empty body (ttwid missing or not accepted)` | `ttwid` 缺失或无效（`a_bogus` 目前不校验） |
+| `[debug] Douyin signed_web_api: signing with uifid from <来源>` / `uifid from <来源> was rejected (...)` | 签名用的 uifid 来自 `cookie UIFID` / `cookie UIFID_TEMP` / `cache` / `webpage UIFID_TEMP`；被判无效的会自动换下一个 |
 | `Unable to obtain Douyin ttwid cookie` | ttwid 注册接口与首页都没下发 ttwid |
 | `Douyin video is unavailable (... filter_reason=...)` | 视频不存在 / 被过滤 |
 | `Unable to fetch Douyin home page for __ac_nonce: ...` | 首页请求失败（网络 / 代理） |
 | `Douyin home page did not issue __ac_nonce` | 首页没下发 nonce，页面请求多半拿到 JS 挑战页 |
-| `webpage: got the anti-bot JS challenge page` | `__ac_*` 缺失或不被接受 |
-| `webpage: got the captcha page (验证码中间页)` | 签名与 nonce 不匹配，或触发风控 |
-| `webpage: RENDER_DATA has no videoDetail` | 页面结构变化，或视频不可用 |
-| `[debug] Douyin original upload of <id> is unavailable: ratio=default returned a transcoded format` | `original_probe` 开启时识别出原片回退为转码档，已去掉 `original` |
-| `[debug] Douyin original probe failed: ...` / `original moov probe failed: ...` | 探测失败，保留未探测的 `original`（不影响提取）；下载 `-f original` 时若 403，先看落到的 CDN 节点与请求是否带了 Referer（2.9） |
+| `ssr_render_data: got the anti-bot JS challenge page` | `__ac_*` 缺失或不被接受 |
+| `ssr_render_data: got the captcha page (验证码中间页)` | 签名与 nonce 不匹配，或触发风控 |
+| `ssr_render_data: RENDER_DATA has no videoDetail` | 页面结构变化，或视频不可用 |
+| `<id>: The original upload is no longer available (ratio=default returned a transcoded format); not listing the original format` | 探测识别出原片回退为转码档，已去掉 `original` |
+| `WARNING: ... Unable to probe the Douyin original upload (...); listing it unprobed below the transcodes, ...` | 探测的第一个请求失败：原片保留但降到转码档之下，不作为默认；下载 `-f original` 时若 403，先看落到的 CDN 节点与请求是否带了 Referer（2.9） |
+| `WARNING: ... Unable to read the codec info of the Douyin original upload ...` / `Unexpected moov range ...` | moov 没读到，原片仍是默认选择，但 info JSON 缺编码与 fps |
+| `WARNING: [Douyin] Douyin original format is listed without probing (original_probe=false) ...` | `original=true` + `original_probe=false` 且输出 info JSON，整次运行打印一次 |
+| `Unknown Douyin strategies: 'web' (available: ...)` / `Unknown Douyin original_probe value: 'size'; write douyin:original_probe=true ...` / `Douyin extractor arg ... must be a list of strings` | 配置写错：旧策略名 `web` / `open` / `webpage`、`original_probe` 的旧取值 `none` / `size` / `full`（现为 `true` / `false`，原 `full` 即 `true`）、Python API 把值写成字符串或布尔值；在任何请求之前报出 |
 | `Douyin short link is invalid or expired` / `points to an unsupported page` | 短码失效，或短链指向图集、西瓜视频等（2.10） |
 
 ### 3.2 判断抖音看到的出口 IP
@@ -469,7 +495,7 @@ for i in range(5):
 
 - 测试时优先走测试代理（出口多为巴西），避免本机 IP 被标记；代理 IP 多半被 Argus 拦截（按 IP 而定），正好用来测签名路径，
   要测不签名路径用国内直连（移动网络）。
-  要单独测某个策略，用 `--extractor-args "douyin:strategies=web"`（或 `open` / `webpage`），不必再 monkeypatch。
+  要单独测某个策略，用 `--extractor-args "douyin:strategies=signed_web_api"`（或 `embed_origin_api` / `ssr_render_data`），不必再 monkeypatch。
 - 测试代理的 IP 随用户名里的会话段（`sn-<随机值>`）切换，同一会话段约 10 分钟内也可能换 IP；
   判断拦截状态时每轮都用新会话段，并以 `x-response-cinfo`（3.2）确认抖音看到的 IP。
 - `-v` 的 `Command-line config` 会原样打印 `--proxy` 的用户名和密码，日志要贴出去之前先过滤。
@@ -478,10 +504,10 @@ for i in range(5):
 - 同一视频两次请求返回的格式数会波动（web API 69↔78、页面 12↔15、TikTok 的 audio 格式时有时无），
   新旧代码对比要背靠背跑，且只比两边共有格式的元数据。
 - 用 `--test` 实际下载（只下 10KB），只列格式发现不了下载阶段的 403。
-- 代理每个请求 4–6 秒，页面方案一个场景要几十秒，批量用例放后台跑，Python 加 `-u` 避免超时丢输出。
+- 代理每个请求 4–6 秒，SSR 方案一个场景要几十秒，批量用例放后台跑，Python 加 `-u` 避免超时丢输出。
 - 签名类算法重构时，用固定输入生成基准输出做逐字回归（`__ac_signature` 用了 204 组）。
 - 验证 ECS 选节点时注意：`dns.alidns.com` 带 `edns_client_subnet` 查到的是另一层 CDN
-  （`via` 形如 `...jswuxi-ct53-bm.Creative`），在那里连 open API 都返回空，不能代表实际访问的节点。
+  （`via` 形如 `...jswuxi-ct53-bm.Creative`），在那里连 embed_origin_api 都返回空，不能代表实际访问的节点。
 - **确认跑的是源码**：Mac 的 `.venv` 的 site-packages 里另装有一份旧版 `yt_dlp`，在仓库根目录以外执行
   `.venv/bin/python -m yt_dlp` 会悄悄用旧代码。验证时 cd 到仓库根目录或设 `PYTHONPATH`，以 `-v` 日志出现 `[debug] Git HEAD:` 为准。
   Windows 下载机同理：它从 `.venv\Lib\site-packages` 导入已安装的 yt_dlp，更新代码后要重新安装才生效。
@@ -498,7 +524,7 @@ for i in range(5):
 | yt-dlp 上游 issue #9667 | [yt-dlp/yt-dlp#9667](https://github.com/yt-dlp/yt-dlp/issues/9667) | 上游 Douyin「Fresh cookies needed」问题的主 issue（仍 open） | 看上游是否有官方修复 |
 | f2 | [Johnserf-Seed/f2](https://github.com/Johnserf-Seed/f2) | 多平台下载器，`ABogus` 算法原始出处（Apache 2.0） | `a_bogus` 算法版本更新 |
 | gmssl | PR 中链接 [duanhongyi/gmssl](https://github.com/duanhongyi/gmssl)，现为 [py-gmssl/py-gmssl](https://github.com/py-gmssl/py-gmssl)（GitHub 显示 MIT） | SM3 纯 Python 实现 | SM3 实现有疑问时对照 |
-| Diana PR #612 | [SuInk/Diana#612](https://github.com/SuInk/Diana/pull/612) | 三级回退：① open.douyin.com 来源免签名 detail；② App feed 接口 `api5-normal-c-hl.amemv.com` / `aweme.snssdk.com` 的 `/aweme/v1/feed/`，`aid=1128` + 安卓 App UA，按 `aweme_id` 过滤（我们实测最高 720p，见 2.8）；③ 老的 Cookie + `uifid` + `a_bogus`（仍 403） | open API 与页面方案都失效时，App feed 可作最后兜底 |
+| Diana PR #612 | [SuInk/Diana#612](https://github.com/SuInk/Diana/pull/612) | 三级回退：① open.douyin.com 来源免签名 detail；② App feed 接口 `api5-normal-c-hl.amemv.com` / `aweme.snssdk.com` 的 `/aweme/v1/feed/`，`aid=1128` + 安卓 App UA，按 `aweme_id` 过滤（我们实测最高 720p，见 2.8）；③ 老的 Cookie + `uifid` + `a_bogus`（仍 403） | embed_origin_api 与 SSR 方案都失效时，App feed 可作最后兜底 |
 | nonebot-plugin-parser-lite PR #311 / #312 | [#311](https://github.com/sokoko-org/nonebot-plugin-parser-lite/pull/311)、[#312](https://github.com/sokoko-org/nonebot-plugin-parser-lite/pull/312) | 同样改用 open.douyin.com 来源，只带 `aweme_id` + `aid`，不再发 `ttwid` 和浏览器 / 设备参数 | 同上 |
 | media-parser Issue #15 | [ucmao/media-parser#15](https://github.com/ucmao/media-parser/issues/15) | 根因分析：Argus 对缺少真实浏览器 `UIFID` 的匿名请求按概率拦截（报告拦截率 40%–50%）；主通道改用移动端 feed 协议 `api5-normal-c-hl.amemv.com`（称 0% 403、覆盖 95% 以上普通视频；我们实测最高 720p，见 2.8），图集走 Web API + 指数退避 | 需要 App 协议方案、或评估国内拦截概率时 |
 | media-parser 抖音解析器 | [docs/parsers/douyin.md](https://github.com/ucmao/media-parser/blob/main/docs/parsers/douyin.md)、`src/parsers/douyin_parser.py`（对比时为 `0b751170a`） | 通道：App feed → iesdouyin 分享页 SSR → web API（配置了 `UIFID` 才签 webSign）→ SSR；覆盖图集（取 `url_list[-1]` 无水印原图）、LivePhoto（称只有 web API 下发 `images[i].video`）、音乐、合集、放映厅 / 短剧、AI 字幕（`cla_info.caption_infos`）、短链与分享口令解析；Cookie 清洗（剔除 `bd_ticket_guard*`、`__security*`、`fpk*` 等，称可防 `Signature Not Found`；称普通作品带 `verify_` 开头的 `s_v_web_id` 会 403，未核实）。实测它给用户的视频是 HEVC 720p（2.8）；文档有几处与代码不符（排序、放映厅接口） | 扩展图集、LivePhoto、音乐、合集，或排查 Cookie 相关 403 时 |
@@ -532,7 +558,7 @@ for i in range(5):
 2. **webSign 的长期稳定性**：盐常量来自安全 SDK 的虚拟机常量池，SDK 更新就可能变（表现为 `Sign Invalid`，3.1）；
    `UIFID_TEMP` 的复用期限只测到约 24 小时。可考虑的改进：
    - 短链解析时 HEAD `www.douyin.com/video/<id>` 也会下发 `UIFID_TEMP`，若在拦截 IP 上有效，可省掉精选页那个请求（未验证）；
-   - open API 被堵后，页面方案（2K）与 iesdouyin 分享页（2.11，免 `__ac`）仍可兜底；App feed 实测最高 720p，只作最后兜底（2.8）。
+   - embed_origin_api 被堵后，SSR 方案（2K）与 iesdouyin 分享页（2.11，免 `__ac`）仍可兜底；App feed 实测最高 720p，只作最后兜底（2.8）。
 3. **原片**：
    - `v96-hcc` 带 Referer 即 403 只在 1 个视频的一次连续请求里观察到（2.9），复核时没再调度到该节点；
      反方向风险也未排除：若 `ratio=default` 某天跳到 `v26-web` 这类必须带 Referer 的节点，不带 Referer 会 403。
@@ -545,7 +571,7 @@ for i in range(5):
 5. **其他 `filter_reason`**：遇到已删除、私密、地区限制的视频时，补充对应的取值和页面表现；
    7422307345595731236 在巴西代理下返回空 `filter_reason`，未用国内直连复测（2.5）。
 6. **fork 尚不支持的内容**：图集（`/note/`、`/slides/`）、LivePhoto、音乐、合集、放映厅 / 短剧。
-   open API 对图集是否返回 `images` 与 LivePhoto 的 `images[i].video` 未测，可用 media-parser 样本清单里的真实作品 ID 测。
+   embed_origin_api 对图集是否返回 `images` 与 LivePhoto 的 `images[i].video` 未测，可用 media-parser 样本清单里的真实作品 ID 测。
 7. **疑点（只读代码，未实测）**：
    - 字幕：`DouyinIE` 沿用 TikTok 的 `cla_info` 字段名（`lang` / `Format`），可能与抖音实际字段不符；
      找不到字幕且有作者名时会用 TikTok 的 `_create_url` 去请求 tiktok.com 页面（只在 `--write-subs` / `--list-subs` 时触发）；
