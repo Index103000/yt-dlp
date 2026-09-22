@@ -70,7 +70,9 @@ def _parse_trak(data, start, end):
                 width, height = struct.unpack('>II', data[matrix_offset + 36:matrix_offset + 44])
                 # 矩阵 a、d 都为 0 时是 90 / 270 度旋转，显示宽高互换
                 rotated = matrix[0] == 0 and matrix[4] == 0
-                track['display'] = (height >> 16, width >> 16) if rotated else (width >> 16, height >> 16)
+                # 16.16 定点数，四舍五入取整（直接 >> 16 会把 1079.99 截成 1079）
+                width, height = round(width / 65536), round(height / 65536)
+                track['display'] = (height, width) if rotated else (width, height)
             elif box_type == b'mdhd':
                 if data[content] == 0:
                     track['timescale'], track['duration'] = struct.unpack('>II', data[content + 12:content + 20])
