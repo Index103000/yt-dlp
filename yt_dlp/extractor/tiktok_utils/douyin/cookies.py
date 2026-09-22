@@ -8,14 +8,14 @@ from .ac_signature import ac_signature_matches_nonce, get_ac_signature
 from .constants import DOUYIN_AC_SIGNATURE_SITE, DOUYIN_DEFAULT_WEB_HEADERS, DOUYIN_WEBPAGE_HOST
 from .tokens import generate_ms_token, generate_s_v_web_id
 
-# web API 签名用的 uifid 在 yt-dlp 缓存里的位置（--no-cache-dir 时不读不写）
+# signed_web_api 签名用的 uifid 在 yt-dlp 缓存里的位置（--no-cache-dir 时不读不写）
 UIFID_CACHE_SECTION = 'douyin'
 UIFID_CACHE_KEY = 'uifid'
 
 
 def get_douyin_uifid(ie, exclude=()):
     """
-    取 web API 签名（x-secsdk-web-signature）用的 uifid，返回 (uifid, 来源)；都没有时返回 (None, None)。
+    取 signed_web_api 签名（x-secsdk-web-signature）用的 uifid，返回 (uifid, 来源)；都没有时返回 (None, None)。
 
     有效的 uifid 只有两种：浏览器页面 JS 算出的 UIFID（--cookies-from-browser 会带来），
     以及服务端在真实页面响应里下发的 UIFID_TEMP。后者不绑定 IP / UA / ttwid / 视频，实测至少 24 小时可复用，
@@ -161,7 +161,7 @@ def clear_douyin_cookie(ie, name):
 
 def ensure_douyin_visitor_cookies(ie, video_id, user_agent):
     """
-    准备 Douyin Web 匿名访客 Cookie，aweme/detail API 方案只需要这些。
+    准备 Douyin Web 匿名访客 Cookie，signed_web_api 只需要这些（ssr_render_data 另需 __ac Cookie）。
 
     1. ttwid
         Douyin / ByteDance Web 访客标识。实测 API 只带 ttwid 即可返回 aweme_detail，缺失则为空响应。
@@ -187,7 +187,7 @@ def ensure_douyin_visitor_cookies(ie, video_id, user_agent):
 
     cookies = ie._get_cookies(DOUYIN_WEBPAGE_HOST)
     if not cookies.get('ttwid'):
-        ie.report_warning('Unable to obtain Douyin ttwid cookie; web API will likely return an empty response', video_id)
+        ie.report_warning('Unable to obtain Douyin ttwid cookie; the aweme/detail web API will likely return an empty response', video_id)
     if not cookies.get('s_v_web_id'):
         ie._set_cookie('.douyin.com', 's_v_web_id', generate_s_v_web_id())
     if not cookies.get('msToken'):
@@ -199,7 +199,7 @@ def ensure_douyin_visitor_cookies(ie, video_id, user_agent):
 
 def ensure_douyin_ac_cookies(ie, video_id, user_agent):
     """
-    准备页面方案（SSR RENDER_DATA）额外需要的 __ac_nonce / __ac_signature。
+    准备 ssr_render_data（精选页 SSR RENDER_DATA）额外需要的 __ac_nonce / __ac_signature。
 
     1. __ac_nonce
         由 www.douyin.com 首页响应 Set-Cookie 下发，有效期 30 分钟（Max-Age=1800）。
@@ -226,7 +226,7 @@ def ensure_douyin_ac_cookies(ie, video_id, user_agent):
         # 首页请求本身失败时 fetch_douyin_home_cookies 已经打印过原因，这里只报「请求成功却没下发」
         if home_fetched:
             ie.report_warning(
-                'Douyin home page did not issue __ac_nonce; webpage will likely get the anti-bot challenge page',
+                'Douyin home page did not issue __ac_nonce; the jingxuan page request will likely get the anti-bot challenge page',
                 video_id)
     elif not (ac_signature and ac_signature_matches_nonce(ac_signature.value, ac_nonce.value)):
         clear_douyin_cookie(ie, '__ac_signature')
