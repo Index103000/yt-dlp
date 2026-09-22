@@ -1796,11 +1796,22 @@ class DouyinIE(TikTokBaseIE):
         把 signed_web_api / embed_origin_api 的 aweme_detail 转成 info dict，并按需追加上传原片格式。
         """
         info = self._parse_aweme_video_app(detail)
+        video = traverse_obj(detail, ('video', {dict})) or {}
         # 部分 douyinvod CDN 节点（如 v26-web）校验 Referer，缺失即 403（X-CCDN-FORBID-CODE: 020200）；
         # aweme/v1/play 镜像也会跳转到这类节点。_parse_aweme_video_app 与 TikTok 共用，故在此补上。
         info['http_headers'] = {'Referer': self._WEBPAGE_HOST}
+        # download_addr 同理在此修正（上游 TikTok 的这段代码相同）：
+        # 1. extract_addr 在 **add_meta 之后写死 preference=-1，传入的「水印版为 -2」被覆盖，水印版与转码档同级，
+        #    -S res / -S size 等排在 preference 之后的用户规则会选中它。按 has_watermark 恢复 -2（17 个样本中与地址里的
+        #    watermark=1 / 0 一致；为 false 的那个是 watermark=0、大小与 normal_1080_0 相同的无水印转码，保持 -1）。
+        # 2. download_addr 的宽高在 17 个样本里都是 720x720，与视频实际分辨率无关，高度又按视频宽高比从 720 推算
+        #    （320x240 的视频被标成 720x540）。实际分辨率未知，去掉宽高，免得 format_sort_force 下按假分辨率选中它。
+        for fmt in info['formats']:
+            if fmt.get('format_id') == 'download_addr':
+                fmt.update({'width': None, 'height': None})
+                if video.get('has_watermark'):
+                    fmt['preference'] = -2
         if not detail.get('images'):
-            video = traverse_obj(detail, ('video', {dict})) or {}
             self._add_douyin_original_format(
                 info['formats'], video_id, traverse_obj(video, ('play_addr', 'uri', {str})),
                 video.get('width'), video.get('height'), video.get('duration'))
