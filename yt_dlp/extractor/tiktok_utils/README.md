@@ -33,7 +33,7 @@ tiktok_utils/formats.py
     - PlayAddr / bitrateInfo / bitRateList 元信息提取
 
 tiktok_utils/douyin/constants.py
-    Douyin 固定 UA、host、默认 headers、open API 来源 headers、__ac_signature 的 site 参数
+    Douyin 固定 UA、host、默认 headers、embed_origin_api 的 open.douyin.com 来源 headers、__ac_signature 的 site 参数
 
 tiktok_utils/douyin/abogus.py
     a_bogus 统一入口
@@ -54,8 +54,8 @@ tiktok_utils/douyin/tokens.py
 
 tiktok_utils/douyin/cookies.py
     Douyin Cookie 管理，允许依赖 InfoExtractor 实例：
-    - ensure_douyin_visitor_cookies   ttwid / s_v_web_id / msToken，web API 与页面方案都需要
-    - ensure_douyin_ac_cookies        __ac_nonce / __ac_signature，仅页面方案需要
+    - ensure_douyin_visitor_cookies   ttwid / s_v_web_id / msToken，signed_web_api 与 ssr_render_data 都需要
+    - ensure_douyin_ac_cookies        __ac_nonce / __ac_signature，仅 ssr_render_data 需要
     - get_douyin_uifid                webSign 用的 uifid：Cookie UIFID → UIFID_TEMP → yt-dlp 缓存
     - store_douyin_uifid / forget_douyin_uifid   缓存页面下发的 UIFID_TEMP / 作废被判无效的值
     - register_douyin_ttwid
@@ -65,8 +65,8 @@ tiktok_utils/douyin/cookies.py
 
 tiktok_utils/douyin/api.py
     Douyin API 查询参数构造：
-    - build_open_aweme_detail_query   open API（免签名）
-    - build_aweme_detail_query        web API
+    - build_open_aweme_detail_query   embed_origin_api（免签名）
+    - build_aweme_detail_query        signed_web_api
     - sign_aweme_detail_query
     - build_original_play_url         上传原片地址（/aweme/v1/play/?ratio=default）
     - response_snippet                失败原因日志用的响应体摘要
@@ -82,7 +82,7 @@ tiktok_utils/douyin/mp4probe.py
     - parse_moov                      vcodec / acodec / 宽高 / fps / vbr / abr / dynamic_range
 
 tiktok_utils/douyin/render_data.py
-    Douyin 页面方案：
+    Douyin ssr_render_data（精选页 SSR）：
     - make_jingxuan_url
     - extract_render_data_json
     - extract_video_detail
@@ -112,22 +112,22 @@ tiktok_utils/douyin/render_data.py
 
 ## DouyinIE 的三级策略
 
-`DouyinIE._real_extract` 默认依次尝试 web → open → webpage，`--extractor-args "douyin:strategies=web,open,webpage"`
-可调整顺序或只用其中几条。除最后一级外每级失败都打印一条带原因的 WARNING
+`DouyinIE._real_extract` 默认依次尝试 `signed_web_api` → `embed_origin_api` → `ssr_render_data`，
+`--extractor-args "douyin:strategies=signed_web_api,embed_origin_api,ssr_render_data"` 可调整顺序或只用其中几条
+（旧名 `web` / `open` / `webpage` 已废弃，会报错）。除最后一级外每级失败都打印 `Douyin <策略名> failed: <原因>`
 （HTTP 状态码 + 响应体、空响应、`filter_detail` 等原始信息），全部失败时最终报错汇总各级原因。
 
-1. **web API**：`aweme/v1/web/aweme/detail/`，`www.douyin.com` 来源 + `a_bogus`
+1. **`signed_web_api`**：网页端接口 `aweme/v1/web/aweme/detail/`，`www.douyin.com` 来源 + `a_bogus`
     - Cookie 只需要访客 Cookie，实测只带 `ttwid` 即可，缺失时返回 200 + 空响应体；`a_bogus` 目前不校验，保留以防重新校验；
     - 部分 IP 会被 ArgusSecurityPlugin 拦截（按 IP 而定，海外居多，国内电信也遇到过）：`403 ... Uifid Not Found`。
       此时带 `uifid` 并按纯算法生成 `x-secsdk-web-signature`（`websign.py`）重试；`uifid` 取浏览器 Cookie `UIFID`、
-      `UIFID_TEMP` 或缓存，都没有时从精选页取服务端下发的 `UIFID_TEMP`（该页面响应留给第 3 级复用），并写入 yt-dlp 缓存；
+      `UIFID_TEMP` 或缓存，都没有时从精选页取服务端下发的 `UIFID_TEMP`（该页面响应留给 `ssr_render_data` 复用），并写入 yt-dlp 缓存；
     - 排第一是因为它不依赖 open.douyin.com 的白名单口子。
-2. **open API**：同一接口，`Origin` / `Referer` 为 `https://open.douyin.com`
+2. **`embed_origin_api`**：同一接口，`Origin` / `Referer` 伪装成官方嵌入播放器所在的 `https://open.douyin.com`
     - 只需 `aweme_id` + `aid=6383`，不需要 `a_bogus`、Cookie，1 个请求完成；
-    - 决定放行的是 `Origin: https://open.douyin.com`（官方嵌入播放器的来源），服务端对它跳过 Argus 与 `ttwid` 要求；
-      这是利用口子，随时可能被堵，所以只作兜底；
-    - 返回的 `aweme_detail` 与 web API 一致，格式为其超集（多几档 540p H.265），最高画质相同。
-3. **webpage**：精选页 `jingxuan?modal_id=` 的 SSR `RENDER_DATA`
+    - 服务端对这个 `Origin` 按白名单跳过 Argus 与 `ttwid` 要求；这是利用口子，随时可能被堵，所以只作兜底；
+    - 返回的 `aweme_detail` 与 `signed_web_api` 一致，格式为其超集（多几档 540p H.265），最高画质相同。
+3. **`ssr_render_data`**：精选页 `jingxuan?modal_id=` 服务端渲染（SSR）的 `RENDER_DATA`
     - 需要 `__ac_nonce` + `__ac_signature`，二者不匹配时服务端返回「验证码中间页」，缺失时返回 JS 挑战页；
     - 服务端对签名只校验 nonce 哈希和末 2 位校验位，不校验 UA、site、时间戳、环境常量；
     - nonce 有效期 30 分钟，签名却长期残留，所以 `ensure_douyin_ac_cookies` 按
@@ -137,10 +137,17 @@ tiktok_utils/douyin/render_data.py
 视频不存在时，两个 API 都返回 200 + `filter_detail.filter_reason`（如 `core_dep`），页面的 `videoDetail` 为 null；
 因此 API 响应带 `filter_reason` 时直接报错「Douyin video is unavailable」，不再尝试后续策略。
 
-三级策略都会额外列出上传原片 `original`（`/aweme/v1/play/?ratio=default`，未转码，实测码率为最高转码档的 2.8–10.3 倍，
-少数老视频会回退为转码档），不作为默认选择，用 `-f original` 选择。原片跳转到的冷存储节点对带 `Referer` 的请求可能 403，
-所以它的 `http_headers` 为 `{}`。`--extractor-args "douyin:original_probe=size"` 在下载前取文件头得到大小、码率、容器并识别回退，
-`full` 再取 moov 得到编码、fps、HDR（`mp4probe.py`）；默认 `none`，不多发请求。
+### 上传原片 original
+
+`--extractor-args "douyin:original=true"`（默认 `false`）时额外列出上传原片 `original`（`/aweme/v1/play/?ratio=default`，
+未转码，实测码率为最高转码档的 2.8–10.3 倍，少数老视频会回退为转码档）：
+
+- 排序：`quality` 取「短边不超过原片的转码档」中最大的 `quality` 再加 0.5（留 16px 余量），排在同档转码档之上，所以默认选择就是它；
+  两条路径都成立（`ssr_render_data` 的转码档没有档位名，`quality` 按实际短边补上）。`-S` 等用户排序规则同样作用于它，`-f worst` 仍是水印版；
+- 探测：默认先读文件头与 moov（`mp4probe.py`），补全编码、大小、fps、HDR、容器（mov / mp4），并去掉回退成转码档的「假原片」。
+  代价：国内直连每个视频多约 0.2–0.6 秒，海外代理 10–20 秒。探测的第一个请求失败时原片降到转码档之下，不作为默认；
+  `douyin:original_probe=false` 可关闭，此时信息不全，若输出 info JSON（`--write-info-json` / `-j` / `-J`）整次运行警告一次；
+- 原片跳转到的冷存储节点对带 `Referer` 的请求可能 403，所以它的 `http_headers` 为 `{}`。
 
 链接除 `/video/<id>`、`?modal_id=` 外，还支持 `iesdouyin.com` / `m.douyin.com` 的 `/share/video/<id>` 与 `v.douyin.com` 短链；
 `webpage_url` 统一为 `https://www.douyin.com/video/<id>`。
