@@ -1,9 +1,30 @@
 # yt_dlp/extractor/tiktok_utils/douyin/api.py
 from __future__ import annotations
 
+import urllib.parse
+
 from .abogus import generate_abogus
 
 AWEME_DETAIL_API_URL = 'https://www.douyin.com/aweme/v1/web/aweme/detail/'
+PLAY_API_URL = 'https://www.iesdouyin.com/aweme/v1/play/'
+
+
+def build_original_play_url(uri):
+    """
+    构造上传原片地址：/aweme/v1/play/ 的 ratio=default 返回未转码的上传文件。
+
+    - uri 即 aweme_detail.video.play_addr.uri / RENDER_DATA videoDetail.video.uri；
+    - 其他 ratio（1080p / 1440p / 2k / 4k）实测都落到同一个 1080p 转码档，只有 default 是原片；
+    - 参数与 media-parser 的 _build_play_endpoint_url 一致（实测可用）。
+    """
+    return f'{PLAY_API_URL}?' + urllib.parse.urlencode({
+        'video_id': uri,
+        'ratio': 'default',
+        'line': '0',
+        'is_play_url': '1',
+        'watermark': '0',
+        'source': 'PackSourceEnum_PUBLISH',
+    })
 
 
 def build_open_aweme_detail_query(video_id):

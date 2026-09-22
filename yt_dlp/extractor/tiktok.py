@@ -15,6 +15,7 @@ from .tiktok_utils.douyin.api import (
     AWEME_DETAIL_API_URL,
     build_aweme_detail_query,
     build_open_aweme_detail_query,
+    build_original_play_url,
     response_snippet,
     sign_aweme_detail_query,
 )
@@ -1520,7 +1521,14 @@ class DouyinIE(TikTokBaseIE):
     #   https://www.douyin.com/video/<aweme_id>
     #   https://www.douyin.com/jingxuan?modal_id=<aweme_id>
     #   https://www.douyin.com/follow/search/...?...&modal_id=<aweme_id>
-    _VALID_URL = r'https?://(?:www\.)?douyin\.com/(?:video/(?P<id>[0-9]+)|[^?#]*\?(?:[^#]*&)?modal_id=(?P<modal_id>[0-9]+))'
+    #   https://www.iesdouyin.com/share/video/<aweme_id>/?...（App 分享页，也是短链的跳转目标）
+    #   https://m.douyin.com/share/video/<aweme_id>
+    #   https://v.douyin.com/<code>/（短链，先解析跳转再提取）
+    _VALID_URL = r'''(?x)https?://(?:
+        (?:www\.)?douyin\.com/(?:video/(?P<id>[0-9]+)|[^?#]*\?(?:[^#]*&)?modal_id=(?P<modal_id>[0-9]+))|
+        (?:(?:www\.)?iesdouyin\.com|m\.douyin\.com)/share/video/(?P<share_id>[0-9]+)(?=[/?#]|$)|
+        v\.douyin\.com/(?!(?:video|share)/)(?P<short>[\w-]+)
+    )'''
     _TESTS = [{
         'url': 'https://www.douyin.com/video/6961737553342991651',
         'md5': '9ecce7bc5b302601018ecb2871c63a75',
@@ -1645,13 +1653,33 @@ class DouyinIE(TikTokBaseIE):
     }, {
         'url': 'https://www.douyin.com/follow/search/asd?aid=c2a3668d-0594-4f50-acf6-7c265fb80ee2&modal_id=7422307345595731236&type=general',
         'only_matching': True,
+    }, {
+        'url': 'https://www.iesdouyin.com/share/video/7676781734972955257/?region=CN&mid=7676781675988159268',
+        'only_matching': True,
+    }, {
+        'url': 'https://m.douyin.com/share/video/7685345542323834441',
+        'only_matching': True,
+    }, {
+        'url': 'https://v.douyin.com/TkRst--_MmU/',
+        'only_matching': True,
     }]
     _UPLOADER_URL_FORMAT = 'https://www.douyin.com/user/%s'
     _WEBPAGE_HOST = 'https://www.douyin.com/'
 
+    @classmethod
+    def _match_id(cls, url):
+        # 作品 ID 分布在 id / modal_id / share_id 三个分组里；让 --download-archive 等能在联网前识别。
+        # 短链要联网解析后才知道 ID，返回 None
+        mobj = cls._match_valid_url(url)
+        return mobj.group('id') or mobj.group('modal_id') or mobj.group('share_id')
+
     def _real_extract(self, url):
         mobj = self._match_valid_url(url)
-        video_id = mobj.group('id') or mobj.group('modal_id')
+        if mobj.group('short'):
+            mobj = self._resolve_douyin_short_url(mobj.group('short'))
+        video_id = mobj.group('id') or mobj.group('modal_id') or mobj.group('share_id')
+        # 分享链接带着分享者参数（u_code / did / iid / share_sign 等），短链只是跳板，统一用规范地址
+        webpage_url = f'https://www.douyin.com/video/{video_id}'
 
         # 依次尝试，每一级失败都打印具体原因，全部失败时汇总进最终报错：
         # 1. open API：open.douyin.com 来源的 aweme/detail，免签名、免 Cookie，海外 IP 也可用；
@@ -1668,17 +1696,71 @@ class DouyinIE(TikTokBaseIE):
                 # 部分 douyinvod CDN 节点（如 v26-web）校验 Referer，缺失即 403（X-CCDN-FORBID-CODE: 020200）；
                 # aweme/v1/play 镜像也会跳转到这类节点。_parse_aweme_video_app 与 TikTok 共用，故在此补上。
                 info['http_headers'] = {'Referer': self._WEBPAGE_HOST}
+                info['webpage_url'] = webpage_url
+                video = traverse_obj(detail, ('video', {dict})) or {}
+                # 这里的转码档 preference 都是 -1，原片同为 -1、靠 quality=0 排在转码档之下、水印 download_addr 之上
+                if not detail.get('images') and (original := self._build_douyin_original_format(
+                        traverse_obj(video, ('play_addr', 'uri', {str})), video.get('width'), video.get('height'),
+                        preference=-1)):
+                    info['formats'].append(original)
                 return info
             failures.append(f'{name}: {reason}')
             self.report_warning(f'Douyin {name} failed: {reason}', video_id)
 
         info, reason = self._extract_douyin_render_data(video_id)
         if info:
+            info['webpage_url'] = webpage_url
             return info
         failures.append(f'webpage: {reason}')
 
         raise ExtractorError(
             'Unable to extract Douyin video info. ' + '; '.join(failures), expected=True)
+
+    def _resolve_douyin_short_url(self, short_code):
+        """
+        解析 v.douyin.com 短链：跟随跳转（→ iesdouyin.com/share/video/<id>/ → www.douyin.com/video/<id>），
+        用 _VALID_URL 从最终地址取作品 ID。短链也可能指向图集（/share/note/、/share/slides/）或西瓜视频（/xg/video/），这些不支持。
+        """
+        # 只取短码重新拼接：分享口令里短链后面常粘着「/3.05」之类的尾巴。
+        # 跳转终点 www.douyin.com/video/<id>（以及失效短码跳到的首页）对 HEAD 返回 404（GET 为 200），
+        # 只需要最终地址，所以放行 404 / 405；v.douyin.com 自身的 403 / 429 / 5xx 等照常报错
+        final_url = self._request_webpage(
+            HEADRequest(f'https://v.douyin.com/{short_code}/'), short_code, 'Resolving Douyin short link',
+            headers={'User-Agent': DOUYIN_USER_AGENT}, expected_status=(404, 405)).url
+        mobj = self._match_valid_url(final_url)
+        if mobj and not mobj.group('short'):
+            return mobj
+        if urllib.parse.urlparse(final_url).path in ('', '/'):
+            raise ExtractorError(
+                'Douyin short link is invalid or expired (redirected to the home page)', expected=True)
+        raise ExtractorError(
+            f'Douyin short link points to an unsupported page (only videos are supported): {final_url}',
+            expected=True)
+
+    def _build_douyin_original_format(self, uri, width, height, preference):
+        """
+        上传原片格式（/aweme/v1/play/?ratio=default）。
+
+        未经转码，码率远高于各转码档（实测 2560x1440 21 Mbps，约为 1440p 转码档的 8 倍），编码与容器随上传文件而定
+        （可能是 H.264 / HEVC、MP4 / MOV），moov 在文件尾。作为额外格式列出、不作为默认选择，需要时用 -f original 选择。
+
+        排序：quality=0 高于缺省（按 -1 计）、低于转码档（按分辨率取值）；preference 由调用方传入，与所在路径的转码档持平，
+        这样默认选择仍是最高转码档，-f worst 仍是水印版 download，而不是体积最大的原片。
+
+        图文作品的 play_addr.uri 是配乐 mp3 的完整 URL，不是视频 ID，此时不生成原片格式。
+        """
+        if not uri or '://' in uri or uri.endswith('.mp3'):
+            return None
+        return {
+            'format_id': 'original',
+            'url': build_original_play_url(uri),
+            'ext': 'mp4',
+            'width': int_or_none(width),
+            'height': int_or_none(height),
+            'format_note': 'original upload, not transcoded; codec / container as uploaded',
+            'preference': preference,
+            'quality': 0,
+        }
 
     def _fetch_douyin_open_detail(self, video_id):
         """
@@ -1907,12 +1989,18 @@ class DouyinIE(TikTokBaseIE):
                 for cover_url in traverse_obj(video_info, (('cover', 'thumbnail'), {url_or_none}))
             ]
 
+        formats = self._extract_douyin_web_formats({
+            **video_info,
+            'download': video_detail.get('download'),
+        })
+        # 这里的转码档 preference 为 -1（且不一定带 quality），水印 download 为 -2；原片取 -2、靠 quality=0 排在 download 之上
+        if not video_detail.get('images') and (original := self._build_douyin_original_format(
+                video_info.get('uri'), video_info.get('width'), video_info.get('height'), preference=-2)):
+            formats.append(original)
+
         return {
             'id': video_id,
-            'formats': self._extract_douyin_web_formats({
-                **video_info,
-                'download': video_detail.get('download'),
-            }),
+            'formats': formats,
             'http_headers': {'Referer': webpage_url},
             **author_info,
             'channel_url': format_field(
