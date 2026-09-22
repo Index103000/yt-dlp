@@ -137,6 +137,13 @@ tiktok_utils/douyin/render_data.py
 视频不存在时，两个 API 都返回 200 + `filter_detail.filter_reason`（如 `core_dep`），页面的 `videoDetail` 为 null；
 因此 API 响应带 `filter_reason` 时直接报错「Douyin video is unavailable」，不再尝试后续策略。
 
+水印版在三条策略下都是 `preference=-2`，排在所有转码档之下，`-f worst` 选中它。API 两级的水印版由与 TikTok 共用的
+`_parse_aweme_video_app` 生成，它把传入的 -2 覆盖成了 -1，宽高也是占位的 720 加推算值，导致 `-S res` / `-S size` 会选中水印版；
+所以在 `_build_douyin_api_info` 里按 `has_watermark` 恢复 -2 并去掉宽高。格式 ID 在 API 两级是 `download_addr`
+（多镜像时为 `download_addr-0/1/2`），在 `ssr_render_data` 是 `download`，排除水印版要写 `[format_id!^=download]`
+（`!=download` 匹配不到 `download_addr`）。`format_sort_force=True` 加 `-S size` 时水印版常因体积最大被选中（force 让用户规则越过
+`preference`），同样用这个筛选排除。详见调研文档 2.12。
+
 ### 上传原片 original
 
 `--extractor-args "douyin:original=true"`（默认 `false`）时额外列出上传原片 `original`（`/aweme/v1/play/?ratio=default`，
