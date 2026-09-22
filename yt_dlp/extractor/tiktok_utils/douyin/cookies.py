@@ -2,10 +2,53 @@
 from __future__ import annotations
 
 import json
+import time
 
 from .ac_signature import ac_signature_matches_nonce, get_ac_signature
 from .constants import DOUYIN_AC_SIGNATURE_SITE, DOUYIN_DEFAULT_WEB_HEADERS, DOUYIN_WEBPAGE_HOST
 from .tokens import generate_ms_token, generate_s_v_web_id
+
+# web API 签名用的 uifid 在 yt-dlp 缓存里的位置（--no-cache-dir 时不读不写）
+UIFID_CACHE_SECTION = 'douyin'
+UIFID_CACHE_KEY = 'uifid'
+
+
+def get_douyin_uifid(ie, exclude=()):
+    """
+    取 web API 签名（x-secsdk-web-signature）用的 uifid，返回 (uifid, 来源)；都没有时返回 (None, None)。
+
+    有效的 uifid 只有两种：浏览器页面 JS 算出的 UIFID（--cookies-from-browser 会带来），
+    以及服务端在真实页面响应里下发的 UIFID_TEMP。后者不绑定 IP / UA / ttwid / 视频，实测至少 24 小时可复用，
+    所以本次运行取得后也存进 yt-dlp 缓存，供下次运行使用。exclude 里是本次已被服务端判为无效的值。
+    """
+    cookies = ie._get_cookies(DOUYIN_WEBPAGE_HOST)
+    for name in ('UIFID', 'UIFID_TEMP'):
+        cookie = cookies.get(name)
+        if cookie and cookie.value and cookie.value not in exclude:
+            return cookie.value, f'cookie {name}'
+
+    cached = ie.cache.load(UIFID_CACHE_SECTION, UIFID_CACHE_KEY)
+    value = cached.get('value') if isinstance(cached, dict) else None
+    if isinstance(value, str) and value and value not in exclude:
+        return value, 'cache'
+    return None, None
+
+
+def store_douyin_uifid(ie, uifid):
+    ie.cache.store(UIFID_CACHE_SECTION, UIFID_CACHE_KEY, {'value': uifid, 'fetched_at': int(time.time())})
+
+
+def forget_douyin_uifid(ie, uifid):
+    """
+    UIFID_TEMP / 缓存里的 uifid 被判无效（Validate Error）时调用：清掉 cookiejar 里的 UIFID_TEMP 与缓存里的同一个值。
+
+    必须清掉 cookiejar 里的：请求只要带着 UIFID_TEMP 或 UIFID（哪怕是无效值），服务端就不会下发新的 UIFID_TEMP。
+    浏览器带来的 UIFID 不在这里删，由调用方通过 exclude 跳过，要取新值时再清。
+    """
+    clear_douyin_cookie(ie, 'UIFID_TEMP')
+    cached = ie.cache.load(UIFID_CACHE_SECTION, UIFID_CACHE_KEY)
+    if isinstance(cached, dict) and cached.get('value') == uifid:
+        ie.cache.store(UIFID_CACHE_SECTION, UIFID_CACHE_KEY, {})
 
 
 def cookie_state_debug(cookies) -> str:
@@ -89,9 +132,9 @@ def fetch_douyin_home_cookies(ie, video_id, user_agent, purpose):
     - ttwid fallback
     - 其他服务端 Set-Cookie
 
-    请求失败时打印 warning（不中断），否则后续只会看到「拿到 JS 挑战页」之类的表象。
+    请求失败时打印 warning（不中断），否则后续只会看到「拿到 JS 挑战页」之类的表象。返回请求是否成功。
     """
-    ie._download_webpage(
+    return ie._download_webpage(
         DOUYIN_WEBPAGE_HOST,
         video_id,
         note=f'Fetching Douyin home page for {purpose}',
@@ -100,7 +143,7 @@ def fetch_douyin_home_cookies(ie, video_id, user_agent, purpose):
         headers={
             **DOUYIN_DEFAULT_WEB_HEADERS,
             'User-Agent': user_agent,
-        })
+        }) is not False
 
 
 def clear_douyin_cookie(ie, name):
@@ -171,15 +214,20 @@ def ensure_douyin_ac_cookies(ie, video_id, user_agent):
     """
     cookies = ie._get_cookies(DOUYIN_WEBPAGE_HOST)
     if not cookies.get('__ac_nonce'):
-        fetch_douyin_home_cookies(ie, video_id, user_agent, '__ac_nonce')
+        home_fetched = fetch_douyin_home_cookies(ie, video_id, user_agent, '__ac_nonce')
         cookies = ie._get_cookies(DOUYIN_WEBPAGE_HOST)
+    else:
+        home_fetched = False
 
     ac_nonce = cookies.get('__ac_nonce')
     ac_signature = cookies.get('__ac_signature')
 
     if not ac_nonce:
-        ie.report_warning(
-            'Douyin home page did not issue __ac_nonce; webpage will likely get the anti-bot challenge page', video_id)
+        # 首页请求本身失败时 fetch_douyin_home_cookies 已经打印过原因，这里只报「请求成功却没下发」
+        if home_fetched:
+            ie.report_warning(
+                'Douyin home page did not issue __ac_nonce; webpage will likely get the anti-bot challenge page',
+                video_id)
     elif not (ac_signature and ac_signature_matches_nonce(ac_signature.value, ac_nonce.value)):
         clear_douyin_cookie(ie, '__ac_signature')
         ie._set_cookie(

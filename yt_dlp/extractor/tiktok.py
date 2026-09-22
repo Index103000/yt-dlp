@@ -25,14 +25,20 @@ from .tiktok_utils.douyin.constants import (
     DOUYIN_USER_AGENT,
 )
 from .tiktok_utils.douyin.cookies import (
+    clear_douyin_cookie,
     ensure_douyin_ac_cookies,
     ensure_douyin_visitor_cookies,
+    forget_douyin_uifid,
+    get_douyin_uifid,
+    store_douyin_uifid,
 )
+from .tiktok_utils.douyin.mp4probe import parse_moov, parse_top_level
 from .tiktok_utils.douyin.render_data import (
     extract_render_data_json,
     extract_video_detail,
     make_jingxuan_url,
 )
+from .tiktok_utils.douyin.websign import sign_web_query
 from .tiktok_utils.formats import (
     build_bytedance_addr_meta,
     build_douyin_web_bitrate_meta,
@@ -41,7 +47,7 @@ from .tiktok_utils.formats import (
     normalize_bytedance_vcodec,
     parse_bytedance_url_key,
 )
-from ..networking import HEADRequest
+from ..networking import HEADRequest, Request
 from ..utils import (
     ExtractorError,
     UnsupportedError,
@@ -815,6 +821,9 @@ class TikTokBaseIE(InfoExtractor):
         return {
             'id': video_id,
             'formats': None if extract_flat else self._extract_web_formats(aweme_detail),
+            # 同分辨率下优先体积 / 码率大的档，而不是按编码优先选 HEVC：web 给出的 HEVC 档码率常只有 H.264 档的 1/3，
+            # 画质明显更差（hankgreen1 576x1024：HEVC 668k 的 VMAF 92.09，H.264 1895k 为 98.58）
+            '_format_sort_fields': ('quality', 'res', 'size', 'br'),
             'subtitles': None if extract_flat else self.extract_subtitles(aweme_detail, video_id, None),
             'http_headers': {'Referer': webpage_url},
             **author_info,
@@ -1673,6 +1682,17 @@ class DouyinIE(TikTokBaseIE):
         mobj = cls._match_valid_url(url)
         return mobj.group('id') or mobj.group('modal_id') or mobj.group('share_id')
 
+    # 取值即 --extractor-args "douyin:strategies=..." 的名字，值为日志里的名称
+    _DOUYIN_STRATEGIES = {
+        'web': 'web API',
+        'open': 'open API',
+        'webpage': 'webpage',
+    }
+    # 本次提取已请求过的精选页 (video_id, webpage, urlh, None)，只缓存成功的响应，每次 _real_extract 开始时重置
+    _douyin_webpage = None
+    # --extractor-args "douyin:original_probe=none|size|full"，在 _real_extract 开头校验
+    _douyin_original_probe = 'none'
+
     def _real_extract(self, url):
         mobj = self._match_valid_url(url)
         if mobj.group('short'):
@@ -1681,37 +1701,40 @@ class DouyinIE(TikTokBaseIE):
         # 分享链接带着分享者参数（u_code / did / iid / share_sign 等），短链只是跳板，统一用规范地址
         webpage_url = f'https://www.douyin.com/video/{video_id}'
 
-        # 依次尝试，每一级失败都打印具体原因，全部失败时汇总进最终报错：
-        # 1. open API：open.douyin.com 来源的 aweme/detail，免签名、免 Cookie，海外 IP 也可用；
-        # 2. web API：www.douyin.com 来源 + a_bogus，部分 IP 会被 ArgusSecurityPlugin 拦截（按 IP 而定，海外居多）；
+        # 默认依次尝试，--extractor-args "douyin:strategies=web,open,webpage" 可调整顺序或只用其中几条：
+        # 1. web API：www.douyin.com 来源 + a_bogus；部分 IP 被 ArgusSecurityPlugin 拦截，此时带 uifid + x-secsdk-web-signature 签名；
+        # 2. open API：open.douyin.com 来源，服务端按 Origin 白名单跳过 Argus 与 ttwid（利用官方嵌入播放器的口子，随时可能被堵）；
         # 3. webpage：精选页 SSR RENDER_DATA + __ac_nonce / __ac_signature。
+        # 每一级失败都打印具体原因，全部失败时汇总进最终报错。
+        strategies = list(dict.fromkeys(filter(None, self._configuration_arg('strategies'))))
+        strategies = strategies or list(self._DOUYIN_STRATEGIES)
+        if unknown := [strategy for strategy in strategies if strategy not in self._DOUYIN_STRATEGIES]:
+            raise ExtractorError(
+                f'Unknown Douyin strategies: {", ".join(map(repr, unknown))} '
+                f'(available: {", ".join(self._DOUYIN_STRATEGIES)})', expected=True)
+        self._douyin_original_probe = self._configuration_arg('original_probe', ['none'])[0]
+        if self._douyin_original_probe not in ('none', 'size', 'full'):
+            raise ExtractorError(
+                f'Unknown Douyin original_probe value: {self._douyin_original_probe!r} (available: none, size, full)',
+                expected=True)
+
+        # 精选页响应既是 UIFID_TEMP 的来源，也是页面方案的数据；本次提取内请求过一次就复用
+        self._douyin_webpage = None
         failures = []
-        for name, fetch_detail in (
-            ('open API', self._fetch_douyin_open_detail),
-            ('web API', self._fetch_douyin_web_detail),
-        ):
-            detail, reason = fetch_detail(video_id)
-            if detail:
-                info = self._parse_aweme_video_app(detail)
-                # 部分 douyinvod CDN 节点（如 v26-web）校验 Referer，缺失即 403（X-CCDN-FORBID-CODE: 020200）；
-                # aweme/v1/play 镜像也会跳转到这类节点。_parse_aweme_video_app 与 TikTok 共用，故在此补上。
-                info['http_headers'] = {'Referer': self._WEBPAGE_HOST}
+        for index, strategy in enumerate(strategies):
+            name = self._DOUYIN_STRATEGIES[strategy]
+            if strategy == 'webpage':
+                info, reason = self._extract_douyin_render_data(video_id)
+            else:
+                fetch_detail = self._fetch_douyin_web_detail if strategy == 'web' else self._fetch_douyin_open_detail
+                detail, reason = fetch_detail(video_id)
+                info = detail and self._build_douyin_api_info(detail, video_id)
+            if info:
                 info['webpage_url'] = webpage_url
-                video = traverse_obj(detail, ('video', {dict})) or {}
-                # 这里的转码档 preference 都是 -1，原片同为 -1、靠 quality=0 排在转码档之下、水印 download_addr 之上
-                if not detail.get('images') and (original := self._build_douyin_original_format(
-                        traverse_obj(video, ('play_addr', 'uri', {str})), video.get('width'), video.get('height'),
-                        preference=-1)):
-                    info['formats'].append(original)
                 return info
             failures.append(f'{name}: {reason}')
-            self.report_warning(f'Douyin {name} failed: {reason}', video_id)
-
-        info, reason = self._extract_douyin_render_data(video_id)
-        if info:
-            info['webpage_url'] = webpage_url
-            return info
-        failures.append(f'webpage: {reason}')
+            if index < len(strategies) - 1:
+                self.report_warning(f'Douyin {name} failed: {reason}', video_id)
 
         raise ExtractorError(
             'Unable to extract Douyin video info. ' + '; '.join(failures), expected=True)
@@ -1737,21 +1760,42 @@ class DouyinIE(TikTokBaseIE):
             f'Douyin short link points to an unsupported page (only videos are supported): {final_url}',
             expected=True)
 
-    def _build_douyin_original_format(self, uri, width, height, preference):
+    def _build_douyin_api_info(self, detail, video_id):
         """
-        上传原片格式（/aweme/v1/play/?ratio=default）。
+        把 web API / open API 的 aweme_detail 转成 info dict，并追加上传原片格式。
+        """
+        info = self._parse_aweme_video_app(detail)
+        # 部分 douyinvod CDN 节点（如 v26-web）校验 Referer，缺失即 403（X-CCDN-FORBID-CODE: 020200）；
+        # aweme/v1/play 镜像也会跳转到这类节点。_parse_aweme_video_app 与 TikTok 共用，故在此补上。
+        info['http_headers'] = {'Referer': self._WEBPAGE_HOST}
+        if not detail.get('images'):
+            video = traverse_obj(detail, ('video', {dict})) or {}
+            # 这里的转码档 preference 都是 -1，原片同为 -1、靠 quality=0 排在转码档之下、水印 download_addr 之上
+            self._add_douyin_original_format(
+                info['formats'], video_id, traverse_obj(video, ('play_addr', 'uri', {str})),
+                video.get('width'), video.get('height'), video.get('duration'), preference=-1)
+        return info
 
-        未经转码，码率远高于各转码档（实测 2560x1440 21 Mbps，约为 1440p 转码档的 8 倍），编码与容器随上传文件而定
-        （可能是 H.264 / HEVC、MP4 / MOV），moov 在文件尾。作为额外格式列出、不作为默认选择，需要时用 -f original 选择。
+    def _add_douyin_original_format(self, formats, video_id, uri, width, height, duration_ms, preference):
+        """
+        追加上传原片格式（/aweme/v1/play/?ratio=default）。
+
+        未经转码，码率是最高转码档的 3–10 倍（实测 17 个视频，含 4K），分辨率与帧率不低于任何转码档；
+        编码与容器随上传文件而定（多为 HEVC + MOV，偶有 HLG 10bit HDR），moov 在文件尾。
+        但老视频的原片可能已被清理，此时 ratio=default 悄悄返回某个转码档（17 个中 1 个）。
+        作为额外格式列出、不作为默认选择，需要时用 -f original 选择。
 
         排序：quality=0 高于缺省（按 -1 计）、低于转码档（按分辨率取值）；preference 由调用方传入，与所在路径的转码档持平，
         这样默认选择仍是最高转码档，-f worst 仍是水印版 download，而不是体积最大的原片。
 
+        下载前默认只知道宽高（取 video.width/height，真原片上与文件一致）；
+        --extractor-args "douyin:original_probe=size|full" 会先探测，见 _probe_douyin_original。
+
         图文作品的 play_addr.uri 是配乐 mp3 的完整 URL，不是视频 ID，此时不生成原片格式。
         """
         if not uri or '://' in uri or uri.endswith('.mp3'):
-            return None
-        return {
+            return
+        original = {
             'format_id': 'original',
             'url': build_original_play_url(uri),
             'ext': 'mp4',
@@ -1760,7 +1804,91 @@ class DouyinIE(TikTokBaseIE):
             'format_note': 'original upload, not transcoded; codec / container as uploaded',
             'preference': preference,
             'quality': 0,
+            # 原片跳转到 colds / hcc / coldx / colda 等冷存储节点：v96-hcc 对带 Referer 的请求一律 403，
+            # 不带 Referer 时各节点都返回 206（两轮实测 16/16、36/36）。所以覆盖掉 info 级的 Referer（转码档的 v26-web 恰好相反，必须带）
+            'http_headers': {},
         }
+        if self._douyin_original_probe in ('size', 'full'):
+            original = self._probe_douyin_original(
+                original, formats, video_id, duration_ms, full=self._douyin_original_probe == 'full')
+        if original:
+            formats.append(original)
+
+    @staticmethod
+    def _douyin_video_object_id(url):
+        # douyinvod 地址形如 /<签名>/<过期时间>/video/tos/cn/<存储桶>/<对象 ID>/，同一文件在各镜像、各次请求间对象 ID 相同
+        path = urllib.parse.urlparse(url or '').path
+        return path.rstrip('/').rpartition('/')[2] if '/video/tos/' in path else None
+
+    def _probe_douyin_original(self, original, formats, video_id, duration_ms, full):
+        """
+        下载前探测原片，返回补全后的格式；判定为回退（不是原片）时返回 None，由调用方去掉该格式。
+
+        size：1 次 Range 请求（跟随 302，约 2 个 HTTP 请求）取文件头 4KB，得到精确大小、平均码率、容器（qt → mov），
+              并识别回退：跳转后的对象 ID 与某个转码档相同，或大小等于某档 data_size；
+        full：再加 1 次 Range 取文件尾的 moov，得到编码、帧率、音视频码率、HDR，宽高改用文件里的值。
+
+        国内直连每个视频多 0.2–0.6 秒，走海外代理 10–20 秒，所以默认关闭。探测失败不影响提取，保留未探测的原片格式。
+        """
+        # 与下载时一致，不带 Referer（见 _add_douyin_original_format 里 http_headers 的说明）
+        headers = {'User-Agent': DOUYIN_USER_AGENT}
+        try:
+            urlh = self._request_webpage(
+                Request(original['url'], headers={**headers, 'Range': 'bytes=0-4095'}), video_id,
+                'Probing Douyin original upload')
+            head = urlh.read(4096)
+            urlh.close()
+        except Exception as e:  # 可选的探测，任何失败都退回未探测的原片格式
+            self.write_debug(f'Douyin original probe failed: {e}')
+            return original
+
+        # 206 的 Content-Length 只是本次区间长度，总大小只能取 Content-Range（为 * 时未知）；服务器忽略 Range 返回 200 时才用 Content-Length
+        if urlh.status == 206:
+            total = int_or_none(self._search_regex(
+                r'/(\d+)\s*$', urlh.headers.get('Content-Range') or '', 'original size', default=None))
+        else:
+            total = int_or_none(urlh.headers.get('Content-Length'))
+        transcode_objects = {self._douyin_video_object_id(fmt.get('url')) for fmt in formats} - {None}
+        transcode_sizes = {fmt['filesize'] for fmt in formats if fmt.get('filesize')}
+        if self._douyin_video_object_id(urlh.url) in transcode_objects or total in transcode_sizes:
+            self.write_debug(
+                f'Douyin original upload of {video_id} is unavailable: ratio=default returned a transcoded format')
+            return None
+
+        brand, boxes = parse_top_level(head)
+        original.update(filter_dict({
+            'filesize': total,
+            'tbr': round(total * 8 / duration_ms) if total and duration_ms else None,
+            'ext': 'mov' if brand and brand.startswith('qt') else 'mp4',
+        }))
+        # 服务器不支持 Range 时不做 moov 探测，免得把整个原片（常见上百 MB）读进内存
+        if not full or not total or not boxes or urlh.status != 206:
+            return original
+
+        # moov 通常紧跟在 mdat 之后、位于文件尾；少数文件 moov 在头部
+        moov_start, moov_end = next(
+            ((start, end) for box_type, start, end in boxes if box_type == b'moov'), (boxes[-1][2], total))
+        moov_end = min(moov_end, total)
+        if not 0 < moov_end - moov_start <= 16 * 1024 * 1024:
+            self.write_debug(f'Douyin original probe: unexpected moov range {moov_start}-{moov_end} of {total}')
+            return original
+        try:
+            if moov_end <= len(head):
+                moov = head[moov_start:moov_end]
+            else:
+                moov_urlh = self._request_webpage(
+                    Request(urlh.url, headers={**headers, 'Range': f'bytes={moov_start}-{moov_end - 1}'}), video_id,
+                    'Probing Douyin original upload metadata')
+                try:
+                    if moov_urlh.status != 206:
+                        raise ValueError(f'expected HTTP 206 for the moov range, got {moov_urlh.status}')
+                    moov = moov_urlh.read(moov_end - moov_start)
+                finally:
+                    moov_urlh.close()
+            original.update(parse_moov(moov))
+        except Exception as e:  # 同上
+            self.write_debug(f'Douyin original moov probe failed: {e}')
+        return original
 
     def _fetch_douyin_open_detail(self, video_id):
         """
@@ -1769,32 +1897,93 @@ class DouyinIE(TikTokBaseIE):
         return self._call_douyin_detail_api(
             video_id,
             'Downloading Douyin open API detail JSON',
-            build_open_aweme_detail_query(video_id),
+            f'{AWEME_DETAIL_API_URL}?{urllib.parse.urlencode(build_open_aweme_detail_query(video_id))}',
             DOUYIN_OPEN_API_HEADERS)
 
     def _fetch_douyin_web_detail(self, video_id):
         """
-        以 www.douyin.com 为来源、带 a_bogus 请求 aweme/detail。
+        以 www.douyin.com 为来源、带 a_bogus 请求 aweme/detail；有 uifid 时一律加 x-secsdk-web-signature 签名。
+
+        uifid 依次取：cookiejar 里的 UIFID（浏览器）、UIFID_TEMP、yt-dlp 缓存。都没有时先发不签名的请求，
+        未被 Argus 拦截的网络上不多发请求；被拦截（Uifid Not Found）或 uifid 失效（Validate Error）时，
+        换下一个来源，都没有再从精选页取服务端下发的 UIFID_TEMP 重试。精选页响应留给页面方案复用。
         """
         user_agent = DOUYIN_USER_AGENT
-
-        # 只依赖访客 Cookie（实测只需 ttwid），__ac_nonce / __ac_signature 仅页面方案需要
+        # 只依赖访客 Cookie（实测只需 ttwid）；__ac_nonce / __ac_signature 只在取 UIFID_TEMP 的页面请求时需要
         ensure_douyin_visitor_cookies(self, video_id, user_agent)
+        # a_bogus 目前不校验，保留以防服务端重新校验；webSign 必须在 a_bogus 之后对最终 query 计算
+        query = urllib.parse.urlencode(sign_aweme_detail_query(build_aweme_detail_query(video_id), user_agent))
 
+        rejected = set()
+        page_tried = False
+        uifid, source = get_douyin_uifid(self)
+        # 每轮要么返回，要么把一个值加进 rejected；候选值（cookie UIFID / UIFID_TEMP、缓存）有限，页面最多取一次，必然终止
+        while True:
+            detail, reason = self._call_douyin_web_api(video_id, query, uifid, source)
+            if detail:
+                return detail, None
+            if uifid and 'Validate Error' in reason:
+                self.write_debug(f'Douyin web API: uifid from {source} was rejected ({reason})')
+                rejected.add(uifid)
+                if source != 'cookie UIFID':
+                    forget_douyin_uifid(self, uifid)
+                uifid, source = get_douyin_uifid(self, exclude=rejected)
+            elif uifid or 'Uifid Not Found' not in reason:
+                # Sign Invalid（签名算法 / 盐可能变了）、Signature Not Found（签名没带上）、空响应等，重试无益
+                return None, reason
+            if uifid:
+                continue
+            if page_tried:
+                return None, f'{reason}; the UIFID_TEMP issued by the webpage was rejected as well'
+            page_tried = True
+            uifid, source = self._obtain_douyin_uifid_temp(video_id, rejected), 'webpage UIFID_TEMP'
+            if not uifid:
+                return None, f'{reason}; unable to obtain a usable UIFID_TEMP from the webpage'
+
+    def _call_douyin_web_api(self, video_id, query, uifid, uifid_source):
+        if uifid:
+            self.write_debug(f'Douyin web API: signing with uifid from {uifid_source}')
+            # 签名后的 query 必须原样发送，不能再交给 query= / update_url_query 重新编码
+            query = sign_web_query(query, uifid)
         return self._call_douyin_detail_api(
             video_id,
-            'Downloading Douyin web API detail JSON',
-            sign_aweme_detail_query(build_aweme_detail_query(video_id), user_agent),
+            'Downloading Douyin web API detail JSON' + (' (signed)' if uifid else ''),
+            f'{AWEME_DETAIL_API_URL}?{query}',
             {
-                'User-Agent': user_agent,
+                'User-Agent': DOUYIN_USER_AGENT,
                 'Referer': self._WEBPAGE_HOST,
             },
             # 实测缺少 ttwid 时服务端返回 200 + 空响应体；a_bogus 目前不校验（不带或乱写都能通过）
             empty_body_hint='ttwid missing or not accepted')
 
-    def _call_douyin_detail_api(self, video_id, note, query, headers, empty_body_hint=None):
+    def _obtain_douyin_uifid_temp(self, video_id, rejected):
         """
-        请求 aweme/detail，返回 (aweme_detail, None) 或 (None, 失败原因)。
+        从精选页响应取服务端下发的 UIFID_TEMP，返回 uifid 或 None。
+
+        www.douyin.com 的真实页面（非挑战页）都会下发，但请求带着 UIFID_TEMP 或 UIFID（哪怕无效）时不会，
+        所以请求前先清掉 UIFID_TEMP 与已判无效的 UIFID；同一会话重取得到的是同一个值，已被判无效的不再使用。
+        """
+        if not (self._douyin_webpage and self._douyin_webpage[0] == video_id):
+            clear_douyin_cookie(self, 'UIFID_TEMP')
+            browser_uifid = self._get_cookies(self._WEBPAGE_HOST).get('UIFID')
+            if browser_uifid and browser_uifid.value in rejected:
+                clear_douyin_cookie(self, 'UIFID')
+        webpage, urlh, reason = self._download_douyin_webpage(video_id)
+        cookie = self._get_cookies(self._WEBPAGE_HOST).get('UIFID_TEMP')
+        if cookie and cookie.value:
+            if cookie.value not in rejected:
+                return cookie.value
+            self.write_debug('Douyin webpage issued a UIFID_TEMP that has already been rejected')
+            return None
+        # 页面不下发时记录页面特征便于定位（挑战页、验证码页、请求仍带着 UIFID 等）
+        self.write_debug('Douyin webpage did not issue a usable UIFID_TEMP: ' + (reason or (
+            f'status={urlh.status}, length={len(webpage)}, challenge={"byted_acrawler.sign" in webpage}, '
+            f'captcha={"<title>验证码中间页</title>" in webpage}, RENDER_DATA={"RENDER_DATA" in webpage}')))
+        return None
+
+    def _call_douyin_detail_api(self, video_id, note, url, headers, empty_body_hint=None):
+        """
+        请求 aweme/detail（url 为含完整 query 的地址），返回 (aweme_detail, None) 或 (None, 失败原因)。
 
         失败原因保留服务端的原始信息，便于从日志判断是被拦截、签名无效还是视频本身不可用：
         - 非 200：状态码 + 响应体，例如 HTTP 403: Blocked by ArgusSecurityPlugin Uifid Not Found；
@@ -1805,8 +1994,7 @@ class DouyinIE(TikTokBaseIE):
         """
         try:
             body, urlh = self._download_webpage_handle(
-                AWEME_DETAIL_API_URL, video_id, note,
-                query=query, headers=headers, expected_status=lambda _: True)
+                url, video_id, note, headers=headers, expected_status=lambda _: True)
         except ExtractorError as e:
             return None, e.orig_msg
 
@@ -1840,31 +2028,66 @@ class DouyinIE(TikTokBaseIE):
 
         return None, f'no aweme_detail in response ({fields})'
 
+    def _download_douyin_webpage(self, video_id):
+        """
+        请求精选页，返回 (webpage, urlh, 失败原因)。页面方案与取 UIFID_TEMP 共用，同一次提取只请求一次。
+
+        经测试，目前只有精选页 modal_id SSR 页面会在 RENDER_DATA 中返回 videoDetail，所以无论原始 URL 是什么，都请求精选页。
+        """
+        if self._douyin_webpage and self._douyin_webpage[0] == video_id:
+            return self._douyin_webpage[1:]
+
+        user_agent = DOUYIN_USER_AGENT
+
+        def cookie_value(name):
+            cookie = self._get_cookies(self._WEBPAGE_HOST).get(name)
+            return cookie.value if cookie else None
+
+        def request_webpage():
+            try:
+                return (*self._download_webpage_handle(
+                    make_jingxuan_url(video_id),
+                    video_id,
+                    'Downloading Douyin video webpage',
+                    headers={
+                        **DOUYIN_DEFAULT_WEB_HEADERS,
+                        'User-Agent': user_agent,
+                    },
+                    expected_status=lambda _: True), None)
+            except ExtractorError as e:
+                return None, None, e.orig_msg
+
+        ensure_douyin_visitor_cookies(self, video_id, user_agent)
+        ensure_douyin_ac_cookies(self, video_id, user_agent)
+        uifid_before = cookie_value('UIFID_TEMP')
+        webpage, urlh, reason = request_webpage()
+        if not reason and 'byted_acrawler.sign' in webpage:
+            # 有的出口上首页不下发 __ac_nonce（响应带 X-TT-System-Error: 3），精选页才返回挑战页并下发 nonce：
+            # 按它重算 __ac_signature 再请求一次（签名没变就不重试，避免空转）
+            signature_before = cookie_value('__ac_signature')
+            ensure_douyin_ac_cookies(self, video_id, user_agent)
+            if cookie_value('__ac_signature') != signature_before:
+                webpage, urlh, reason = request_webpage()
+        if reason:
+            # 网络失败不缓存，后面的页面方案还可以自己再试一次
+            return None, None, reason
+        self._douyin_webpage = (video_id, webpage, urlh, None)
+
+        # 页面这次新下发的 UIFID_TEMP 存进缓存，供之后（包括下次运行）的 web API 签名使用
+        uifid = cookie_value('UIFID_TEMP')
+        if uifid and uifid != uifid_before:
+            store_douyin_uifid(self, uifid)
+        return webpage, urlh, None
+
     def _extract_douyin_render_data(self, video_id):
         """
         通过 Douyin SSR RENDER_DATA 获取 videoDetail，返回 (info, None) 或 (None, 失败原因)。
         """
-        user_agent = DOUYIN_USER_AGENT
+        webpage, urlh, reason = self._download_douyin_webpage(video_id)
+        if reason:
+            return None, reason
 
-        ensure_douyin_visitor_cookies(self, video_id, user_agent)
-        ensure_douyin_ac_cookies(self, video_id, user_agent)
-
-        # 经测试，目前只有精选页 modal_id SSR 页面会在 RENDER_DATA 中返回 videoDetail，
-        # 所以无论原始 URL 是什么，都请求精选页
         webpage_url = make_jingxuan_url(video_id)
-        try:
-            webpage, urlh = self._download_webpage_handle(
-                webpage_url,
-                video_id,
-                'Downloading Douyin video webpage',
-                headers={
-                    **DOUYIN_DEFAULT_WEB_HEADERS,
-                    'User-Agent': user_agent,
-                },
-                expected_status=lambda _: True)
-        except ExtractorError as e:
-            return None, e.orig_msg
-
         render_data = extract_render_data_json(self, webpage, video_id)
         video_detail = extract_video_detail(render_data)
 
@@ -1994,9 +2217,10 @@ class DouyinIE(TikTokBaseIE):
             'download': video_detail.get('download'),
         })
         # 这里的转码档 preference 为 -1（且不一定带 quality），水印 download 为 -2；原片取 -2、靠 quality=0 排在 download 之上
-        if not video_detail.get('images') and (original := self._build_douyin_original_format(
-                video_info.get('uri'), video_info.get('width'), video_info.get('height'), preference=-2)):
-            formats.append(original)
+        if not video_detail.get('images'):
+            self._add_douyin_original_format(
+                formats, video_id, video_info.get('uri'), video_info.get('width'), video_info.get('height'),
+                video_info.get('duration'), preference=-2)
 
         return {
             'id': video_id,
