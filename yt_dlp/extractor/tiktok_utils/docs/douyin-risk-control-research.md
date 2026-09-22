@@ -18,7 +18,7 @@ API 响应带 `filter_reason`（视频不存在等）时直接报错，不再尝
 
 | 策略 | 请求 | 依赖 | 海外 IP | 国内移动 | 国内电信 |
 | --- | --- | --- | --- | --- | --- |
-| 1. web API | `aweme/v1/web/aweme/detail/`，`www.douyin.com` 来源 + `a_bogus`；被 Argus 拦截时加 `uifid` + `x-secsdk-web-signature` | `ttwid`；拦截时要有效 `uifid` | ✅（拦截 IP 靠签名，2.1） | ✅ 不签名即可 | 未签名时 5/5 被拦；签名版未在该机实测，按代理拦截 IP 上的结果应可用 |
+| 1. web API | `aweme/v1/web/aweme/detail/`，`www.douyin.com` 来源 + `a_bogus`；被 Argus 拦截时加 `uifid` + `x-secsdk-web-signature` | `ttwid`；拦截时要有效 `uifid` | ✅（拦截 IP 靠签名，2.1） | ✅ 不签名即可 | ✅ 靠签名（2026-09-22 实测：未签名被拦 → 精选页取 `UIFID_TEMP` → 签名 200）；未签名时 5/5 被拦 |
 | 2. open API | 同一接口，`Origin` 为 `https://open.douyin.com`，只带 `aweme_id` + `aid` | 无 | ✅ | ✅ | ✅ |
 | 3. webpage | 精选页 `jingxuan?modal_id=` 的 SSR `RENDER_DATA` | `__ac_nonce` + `__ac_signature` | ✅ | ✅ | ✅ |
 
