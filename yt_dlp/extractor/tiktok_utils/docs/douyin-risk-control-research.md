@@ -1,6 +1,6 @@
 # 抖音 / TikTok 风控调研记录
 
-- 调研时间：2026-09-21
+- 调研时间：2026-09-21，2026-09-22 补充 Argus 签名实测、上传原片、短链与分享链接、与 media-parser 的对比
 - 适用分支：`tiktok`
 - 对应代码：`yt_dlp/extractor/tiktok.py`（`DouyinIE`、`TikTokBaseIE._extract_web_formats`）、`yt_dlp/extractor/tiktok_utils/douyin/*`
 
@@ -27,7 +27,11 @@ API 响应带 `filter_reason`（视频不存在等）时直接报错，不再尝
 
 下载视频时，两个 API 策略的格式都必须带 `Referer`，见 2.4。
 
-另有 App feed 接口也能绕开 Argus，但实测最高只有 720p，未接入，见 2.8。
+- 支持的链接：`www.douyin.com/video/<id>`、任意路径上的 `?modal_id=<id>`、`iesdouyin.com` / `m.douyin.com` 的 `/share/video/<id>`、
+  `v.douyin.com/<code>` 短链（见 2.10）。图集、音乐、合集等不支持。`webpage_url` 统一为 `https://www.douyin.com/video/<id>`。
+- 除转码档外，额外列出上传原片 `original`（不作为默认，`-f original` 选择），见 2.9。
+- web API 在 Argus 拦截的 IP 上可以靠 `x-secsdk-web-signature` 通过（2.1 实测），fork 尚未实现。
+- 另有 App feed 接口也能绕开 Argus，但实测最高只有 720p，未接入，见 2.8。
 
 ------
 
@@ -37,26 +41,47 @@ API 响应带 `filter_reason`（视频不存在等）时直接报错，不再尝
 
 抖音在 `aweme/v1/web/aweme/detail/` 前面加了边缘安全插件 `ArgusSecurityPlugin`，被拦时返回 `403`，响应体是纯文本：
 
+服务端的判定顺序（2026-09-22 在 6 个拦截 IP 上实测，另由独立复核在 2 个拦截 IP 上复现；文案即响应体原文）：
+
 | 请求内容 | 响应 |
 | --- | --- |
-| 不带 `uifid` query 参数 | `403 Blocked by ArgusSecurityPlugin Uifid Not Found` |
-| 带 `uifid` 参数（任意值，包括随机 320 位 hex、浏览器真实的 UIFID） | `403 Blocked by ArgusSecurityPlugin Signature Not Found` |
-| 只在 Cookie 里带 `UIFID`，不带 query 参数 | 仍是 `Uifid Not Found`，说明它看的是 query 参数 |
+| 不带 `uifid`（只放 Cookie `UIFID` 也算不带） | `403 Blocked by ArgusSecurityPlugin Uifid Not Found` |
+| 带 `uifid`（query 参数或 `uifid` 请求头都算），但没有签名 | `403 ... Signature Not Found` |
+| `uifid` 无效（如随机 hex），无论签名对错 | `403 ... Validate Error` |
+| `uifid` 有效，签名错误（随机 md5，或签名后改动任一 query 参数） | `403 ... Sign Invalid`，响应头 `argus_security_code: web_id_sign_invalid` |
+| `uifid` 有效 + 签名正确 | ✅ 200 |
 
 拦不拦按客户端 IP 而定，不是「海外一律拦」：同一时间换 5 个巴西住宅 IP，3 个被拦（`Uifid Not Found`），
-另外 2 个上 web API 和不带签名的精简请求都正常返回。按什么判断（IP 信誉、ASN、概率）未知。
+另外 2 个上 web API 和不带签名的精简请求都正常返回；后续两轮分别为 6 个中 4 个、11 个中 4 个被拦（出口也有土耳其、美国节点）。
+按什么判断（IP 信誉、ASN、概率）未知；同一拦截 IP 约 1 分钟的测试窗口内拦截状态没有变化。
 
-`Signature Not Found` 缺的是 `x-secsdk-web-signature`（外部项目称为 webSign），只有真实抖音页面里的安全 SDK（JSVMP）能生成，
-生成顺序是先 `a_bogus` 再 webSign，输入包括完整 URL、时间戳、`uifid`（见 4. 参考项目中的 nous-app、amagi）。
+**`x-secsdk-web-signature`（webSign）是纯算法，可以自己生成**：
 
-以下尝试都没能绕过 `Signature Not Found`：
+```
+明文 = f"{uifid}_{timestamp}_A96D855A08C0A9707F8BEF0D9A527E4E_{canonical_query}"
+签名 = md5(明文) 的 32 位小写 hex，作为最后一个 query 参数 x-secsdk-web-signature
+```
 
-- 补齐浏览器请求中的 `msToken`、`verifyFp` / `fp`（取值即 `s_v_web_id`）、`webid`、新版本号等 query 参数；
-- 用服务端下发的 `UIFID_TEMP`、浏览器的 `UIFID`、随机值分别作 Cookie 和 query 参数。
+- `canonical_query`：保持原参数顺序、不排序；每个 value 先解码（`+` 变空格）再按 `encodeURIComponent` 重新编码
+  （保留 `!*'()`），key 只解码不重编码；无 `=` 的参数补成 `k=`；query 里没有 `uifid` 就追加 `&uifid=<uifid>`，
+  再追加 `&timestamp=<秒级时间戳>`，然后整体参与哈希。
+- 出处：[cv-cat/DouYin_Spider](https://github.com/cv-cat/DouYin_Spider) `utils/secsdk_web_sign.py`（2026-08-30）。
+  作者 hook 了安全 SDK `runtime_bundler_34.js` 中的 `webSignUrl` 与 `CryptoJS.MD5`，盐为 SDK 虚拟机常量池里写死的值，
+  称用 5 条真实抓包逐字节命中；amagi、media-parser 都移植自它。media-parser 的文档写「按键名排序」，与其代码不符（代码不排序）。
+- 实测细节：不需要 `a_bogus`（先算 `a_bogus` 再签名也能过）；`timestamp` 不查时效（365 天前的也能过）；
+  最小可行形态是沿用 fork 现有 query + Edge UA + 首页 Referer，Cookie 只带 `ttwid`，`uifid` 只放 query，再追加 `timestamp` 和签名；
+  yt-dlp 的 `Request` / `update_url_query` 不会改写已签名的 URL。
+- `uifid` 的有效来源只有两种：
+  - 浏览器里的 `UIFID` Cookie（320 位 hex，页面 JS 计算）；实测改首位或末位 1 个字符仍通过，保留前 64 位、其余换成随机值则 `Validate Error`；
+  - 服务端下发的 `UIFID_TEMP`（160 位 hex，偶见 192 位）：只在通过 `__ac` 挑战后的精选页真实页面响应里下发（首页与挑战页都不下发），
+    同一响应还下发一个 JWT 形态的 `web_sign_token`，用途未知。`UIFID_TEMP` 不绑定 IP、至少约 2 小时内可复用（单样本）；
+    但独立复核在 4 个拦截 IP 中有 2 个取不到它，原因未查明。
+- fork 目前**没有实现** webSign：open API 已能覆盖所有网络。若 open API 失效，可以在 web API 上实现它，
+  `uifid` 优先取 `--cookies-from-browser` 带来的 `UIFID`，其次取页面方案顺带拿到的 `UIFID_TEMP`（缓存供批量任务复用）。
 
 `UIFID` 相关 Cookie（在内置浏览器中观察）：
 
-- `UIFID_TEMP`：160 位 hex，由服务端在页面响应的 `Set-Cookie` 下发；
+- `UIFID_TEMP`：见上；
 - `UIFID`：320 位 hex，由页面 JS 计算，与 `UIFID_TEMP` 只有前 64 位相同；
 - 页面发出的 `aweme/v1/web/*` 请求 query 中带 `uifid=<UIFID>`、`webid`、`verifyFp`、`fp`、`msToken`、`a_bogus`。
 
@@ -178,7 +203,9 @@ https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=<id>&aid=6383&msToken
 - 两个 API 都返回 `200`，`aweme_detail` 为 null，附 `filter_detail`：`{"filter_reason": "core_dep", "detail_msg": "", "notice": "", ...}`；
 - 页面方案有 `RENDER_DATA`，但 `app.videoDetail` 为 null；
 - 所以 API 响应带 `filter_reason` 就直接报错 `Douyin video is unavailable (status_code=0, filter_reason=core_dep)`。
-- 其他 `filter_reason`（已删除、私密、地区限制等）尚未遇到实例。
+- iesdouyin 分享页（2.11）对不存在的作品返回 `item_list=[]`，`filter_list[0].filter_reason='SYSTEM_ITEM_NOT_EXIST'`。
+- 其他 `filter_reason`（已删除、私密、地区限制等）尚未遇到实例；media-parser 的注释和文档提到
+  `status_self_see`、`status_deleted`、`status_part_see`，但其仓库里没有样本，未核实。
 
 ### 2.6 页面方案的页面特征
 
@@ -214,6 +241,14 @@ User-Agent: com.ss.android.ugc.aweme/300904 (Linux; U; Android 12; zh_CN; SM-G97
 | 7686096925641338809 | 7 个视频 | 第 1 个 | 7 | 1280x720 | 29 档，最高 2560x1440 |
 | 6961737553342991651（老视频） | 7 个视频 | 第 1 个 | 2 | 720x1280 | — |
 
+2026-09-22 按 media-parser 原样复现（国内直连，IPv4 / IPv6 两个出口结果相同）：
+
+- feed 的 `bit_rate` 全部是 H.265（`is_h265=1`），media-parser 的「H.264 优先」落空，它最终交给用户的是 **HEVC 1280x720**
+  （809 为 8.5MB）；feed 自带的 `play_addr_h264` 更低（809 为 1024x576）；
+- `video.width/height` 写着 2560x1440，但 feed 不提供 1080p 以上的转码档；
+- 耗时 2.2–2.4 秒（media-parser 文档称约 200ms），离它设置的 4 秒超时只剩不到 2 秒；
+- `play_addr.uri` 与 open API 相同，所以 2.9 的 `ratio=default` 原片 feed 也能拿到，但 open API 同样能，feed 没有独有优势。
+
 限制：
 
 - **画质最高 720p**，档位也少得多，远不如 open API 和页面方案（都能拿到 2K）；
@@ -222,6 +257,58 @@ User-Agent: com.ss.android.ugc.aweme/300904 (Linux; U; Android 12; zh_CN; SM-G97
 - 未在海外、电信网络下测过。
 
 所以它只适合做最后兜底，排在页面方案之后。
+
+### 2.9 上传原片 ratio=default（已接入为 original 格式）
+
+`/aweme/v1/play/?video_id=<uri>&ratio=<ratio>`（`www.iesdouyin.com` 与 `aweme.snssdk.com` 结果相同）按 `ratio` 返回不同文件：
+
+| `ratio` | 实际得到 |
+| --- | --- |
+| `1080p`、`1440p`、`2k`、`2160p`、`4k` | 全部落到同一个 1080p 转码档（即 open API 的 `normal_1080_0`，H.264 1920x1080） |
+| `default` | **上传原片**，未经转码 |
+
+原片实测（`uri` 取 `aweme_detail.video.play_addr.uri` 或 RENDER_DATA `videoDetail.video.uri`，两者相同）：
+
+| 视频 | 原片 | 同视频最高转码档 |
+| --- | --- | --- |
+| 7686096925641338809 | H.264 2560x1440 60fps，21.3 Mbps，191.6MB（MP4） | HEVC 2560x1440，2.65 Mbps，23.6MB |
+| 7686432847778982833 | HEVC 2560x1440 60fps，14.7 Mbps，122MB（QuickTime） | HEVC 2560x1440，1.78 Mbps，14.6MB |
+| 6961737553342991651（老视频） | HEVC 1080x1920 30fps，6.9 Mbps，17.3MB（QuickTime，iPhone 直传） | H.264 1080x1920 |
+
+- 编码与容器随上传文件而定（3 个样本中 2 个是 QuickTime），`moov` 都在文件尾（不是 faststart）；
+- 抽帧目视都没有抖音 logo 或抖音号水印（只看了首帧与少量中间帧，片尾未查）；
+- 直连与海外代理都能下载（Range 返回 206，总大小一致，头尾字节 md5 相同），海外代理下很慢；
+- 实现：`DouyinIE._build_douyin_original_format` 生成 `format_id='original'`，宽高取 `video.width/height`（显示方向，竖屏为 1080x1920），
+  `vcodec` / `acodec` / 大小未知；`quality=0` 且 `preference` 与所在路径的转码档持平（API 为 -1，页面方案为 -2），
+  因此默认选择仍是最高转码档，`-f worst` 仍是水印版 download，只有 `-f original` 会选中它。
+  最初用 `preference=-2` 时 API 路径的 `-f worst` 选中了体积最大的原片，已修正。
+- 图文作品的 `play_addr.uri` 是配乐 mp3 的完整 URL，不是视频 ID；作品带 `images`、或 `uri` 含 `://` / 以 `.mp3` 结尾时不生成原片
+  （最初版本会拼出无效地址并被默认选中，下载报 `Did not get any data blocks`，已修正）。
+
+### 2.10 短链与分享链接（已接入）
+
+- 短链跳转链：`v.douyin.com/<code>/` 302 → `www.iesdouyin.com/share/video/<id>/?region=CN&mid=...&u_code=...&did=...`
+  302（桌面 UA）→ `www.douyin.com/video/<id>?previous_page=app_code_link`；
+  最后一跳对 HEAD 返回 404、对 GET 返回 200，所以解析时放行 404 / 405，只取最终地址，不下载页面；
+- 失效或错误的短码 302 到 `https://www.douyin.com` 首页；指向西瓜视频的短链跳到 `www.iesdouyin.com/xg/video/<id>/`；
+  图集指向 `/share/note/`、`/share/slides/`：这些都给出明确报错；
+- 分享口令里短链后面常粘着 `/3.05` 之类的尾巴，只取短码重新拼接；
+- 分享链接带着分享者参数（`u_code`、`did`、`iid`、`share_sign`、`utm_*`），会进 `--embed-metadata` 的 `purl`/`comment`，
+  所以 `webpage_url` 统一为 `https://www.douyin.com/video/<id>`；`_match_id` 覆写为返回 `id` / `modal_id` / `share_id`，
+  分享链接可在联网前被 `--download-archive` 跳过（短链必须联网才知道 ID）。
+
+### 2.11 iesdouyin 分享页 SSR（未接入，仅实测）
+
+`https://www.iesdouyin.com/share/video/<id>` 是 App 分享出去的页面（media-parser 的第 2 顺位通道）：
+
+- **必须用移动 UA**（Android、iPhone 都可以）：桌面 UA 会 302 到 `www.douyin.com/video/<id>?previous_page=app_code_link`，落到 JS 挑战页；
+- 移动 UA 下**不需要 `__ac` 签名、`a_bogus`、`msToken`**，页面直接内嵌 `_ROUTER_DATA` → `videoInfoRes.item_list`；
+- **但必须带服务端签发的有效 `ttwid`**：不带 Cookie、带伪造签名段的 `ttwid` 都只拿到没有 `videoInfoRes` 的空壳（约 32KB）；
+  一个 2024-08 签发的旧 `ttwid` 仍然有效（说明校验签名而非新鲜度，单样本）；分享页本身对无 Cookie 请求约 5/7 次会下发 `ttwid`；
+- 数据少：`bit_rate` 为 null、没有 `download_addr`，`play_addr` 只有一条 `playwm ... ratio=720p`（H.264 1280x720，抽帧未见抖音 logo）；
+  但带着 `uri`，可以用 2.9 的 `ratio=default` 拿原片；
+- 响应里有 `is_oversea` 字段（国内为 0），海外表现未测；
+- 结论：门槛比精选页低（免 `__ac`），数据比精选页少（没有码率阶梯），可作为页面方案失效时的备选。
 
 ------
 
@@ -313,6 +400,11 @@ for i in range(5):
 - 签名类算法重构时，用固定输入生成基准输出做逐字回归（`__ac_signature` 用了 204 组）。
 - 验证 ECS 选节点时注意：`dns.alidns.com` 带 `edns_client_subnet` 查到的是另一层 CDN
   （`via` 形如 `...jswuxi-ct53-bm.Creative`），在那里连 open API 都返回空，不能代表实际访问的节点。
+- **确认跑的是源码**：Mac 的 `.venv` 的 site-packages 里另装有一份旧版 `yt_dlp`，在仓库根目录以外执行
+  `.venv/bin/python -m yt_dlp` 会悄悄用旧代码。验证时 cd 到仓库根目录或设 `PYTHONPATH`，以 `-v` 日志出现 `[debug] Git HEAD:` 为准。
+  Windows 下载机同理：它从 `.venv\Lib\site-packages` 导入已安装的 yt_dlp，更新代码后要重新安装才生效。
+- 格式选择改动（如新增格式）要回归 `-f worst` / `wv*` 等，不只看默认选择：可以把保存的 `aweme_detail` / 精选页 HTML
+  喂给 `_real_extract`（monkeypatch 网络函数）离线比对新旧选择结果。
 
 ------
 
@@ -327,9 +419,11 @@ for i in range(5):
 | Diana PR #612 | [SuInk/Diana#612](https://github.com/SuInk/Diana/pull/612) | 三级回退：① open.douyin.com 来源免签名 detail；② App feed 接口 `api5-normal-c-hl.amemv.com` / `aweme.snssdk.com` 的 `/aweme/v1/feed/`，`aid=1128` + 安卓 App UA，按 `aweme_id` 过滤（我们实测最高 720p，见 2.8）；③ 老的 Cookie + `uifid` + `a_bogus`（仍 403） | open API 与页面方案都失效时，App feed 可作最后兜底 |
 | nonebot-plugin-parser-lite PR #311 / #312 | [#311](https://github.com/sokoko-org/nonebot-plugin-parser-lite/pull/311)、[#312](https://github.com/sokoko-org/nonebot-plugin-parser-lite/pull/312) | 同样改用 open.douyin.com 来源，只带 `aweme_id` + `aid`，不再发 `ttwid` 和浏览器 / 设备参数 | 同上 |
 | media-parser Issue #15 | [ucmao/media-parser#15](https://github.com/ucmao/media-parser/issues/15) | 根因分析：Argus 对缺少真实浏览器 `UIFID` 的匿名请求按概率拦截（报告拦截率 40%–50%）；主通道改用移动端 feed 协议 `api5-normal-c-hl.amemv.com`（称 0% 403、覆盖 95% 以上普通视频；我们实测最高 720p，见 2.8），图集走 Web API + 指数退避 | 需要 App 协议方案、或评估国内拦截概率时 |
-| nous-app PR #2360 | [iocrazy/nous-app#2360](https://github.com/iocrazy/nous-app/pull/2360) | 实现 Argus webSign：`x-secsdk-web-signature`，Node 子进程跑 `websign_env.js` / `websign_runtime.js`，先 `a_bogus` 再 webSign，输入为带 `a_bogus` 的 URL、时间戳、`uifid` | 决定自己实现 webSign 时 |
+| media-parser 抖音解析器 | [docs/parsers/douyin.md](https://github.com/ucmao/media-parser/blob/main/docs/parsers/douyin.md)、`src/parsers/douyin_parser.py`（对比时为 `0b751170a`） | 通道：App feed → iesdouyin 分享页 SSR → web API（配置了 `UIFID` 才签 webSign）→ SSR；覆盖图集（取 `url_list[-1]` 无水印原图）、LivePhoto（称只有 web API 下发 `images[i].video`）、音乐、合集、放映厅 / 短剧、AI 字幕（`cla_info.caption_infos`）、短链与分享口令解析；Cookie 清洗（剔除 `bd_ticket_guard*`、`__security*`、`fpk*` 等，称可防 `Signature Not Found`；称普通作品带 `verify_` 开头的 `s_v_web_id` 会 403，未核实）。实测它给用户的视频是 HEVC 720p（2.8）；文档有几处与代码不符（排序、放映厅接口） | 扩展图集、LivePhoto、音乐、合集，或排查 Cookie 相关 403 时 |
+| DouYin_Spider | [cv-cat/DouYin_Spider](https://github.com/cv-cat/DouYin_Spider) `utils/secsdk_web_sign.py` | `x-secsdk-web-signature` 纯算实现的出处（2026-08-30），附逆向路径、规范化规则、受保护接口清单（`aweme/detail`、`aweme/post`、`aweme/favorite`、`mix/aweme`、`tab/feed` 等） | 实现 webSign，或它失效时 |
+| nous-app PR #2360 | [iocrazy/nous-app#2360](https://github.com/iocrazy/nous-app/pull/2360) | 实现 Argus webSign：`x-secsdk-web-signature`，Node 子进程跑 `websign_env.js` / `websign_runtime.js`，先 `a_bogus` 再 webSign，输入为带 `a_bogus` 的 URL、时间戳、`uifid`（实际上纯算即可，见 2.1 与 DouYin_Spider） | 纯算失效、需要跑真实 SDK 时 |
 | amagi PR #188 | [ikenxuan/amagi#188](https://github.com/ikenxuan/amagi/pull/188) | ① 免鉴权接口：`iesdouyin.com/web/api/v2/user/info/`（用户名转 `sec_uid`）、`/v2/music/info/`、`/v2/music/list/aweme/`、`api.amemv.com/aweme/v1/im/resources/emoji/`；② `webid` 与会话 Cookie 不匹配时服务端静默返回 200 空响应，改为读响应头 `cookie_ttwidinfo_webid` 按 `ttwid` 缓存；③ `x-secsdk-web-signature` 为 32 位小写 hex、放在 query 中，只对 SDK 策略表中的部分路径生效，必须是最后一步；④ Argus 拦截时重新生成 `msToken` / `verifyFp` / `a_bogus` 线性退避重试最多 5 次 | 扩展到用户主页、音乐等接口，或遇到莫名 200 空响应时 |
-| douyin-downloader | [jiji262/douyin-downloader](https://github.com/jiji262/douyin-downloader) | 说明 Argus 对非浏览器请求返回 `Uifid Not Found`、webSign 只能在真实页面内生成；主页批量翻页被拦时用 Playwright 启动真实浏览器滚动采集（默认有头，需手动过验证码） | 需要浏览器兜底方案时 |
+| douyin-downloader | [jiji262/douyin-downloader](https://github.com/jiji262/douyin-downloader) | 说明 Argus 对非浏览器请求返回 `Uifid Not Found`，并称 webSign 只能在真实页面内生成（已被 DouYin_Spider 的纯算实现与我们的实测推翻）；主页批量翻页被拦时用 Playwright 启动真实浏览器滚动采集（默认有头，需手动过验证码） | 需要浏览器兜底方案时 |
 | douyinie Issue #125 | [monet88/douyinie#125](https://github.com/monet88/douyinie/issues/125) | 汇总：`aweme/detail`、`aweme/post` 被 Argus 确定性拦截，应视为风控而非瞬时错误、不要盲目重试；源头为 douyin-downloader 2026-09-14 的提交 `47f4eef` | 了解 Argus 覆盖范围时 |
 
 延伸阅读（a_bogus 逆向分析文章，未细看）：
@@ -351,7 +445,16 @@ for i in range(5):
    从移动网络用 `curl --resolve www.douyin.com:443:<IP>` 把 web API 请求发到该节点（先确认 `via` 是 `CHN-...-CT5-...` 这类节点）。
    也被拦就是按节点，能过就是按客户端 IP。
 2. **open API 被堵后的下一步**：页面方案能拿到 2K，仍是首选兜底；
-   要找新的高画质 API 通道，只能实现 webSign（nous-app 的 Node 方案，工作量大、需跟随 SDK 更新）；
-   App feed 实测最高 720p，只在页面方案也失效时作最后兜底（见 2.8）。
+   要恢复高画质 API 通道，在 web API 上实现 webSign（2.1 已实测可行，纯算、工作量小），
+   `uifid` 取浏览器 Cookie 里的 `UIFID` 或页面方案顺带拿到的 `UIFID_TEMP`；待查：`UIFID_TEMP` 取不到的原因、复用期限、
+   盐常量的长期稳定性。iesdouyin 分享页（2.11）可作为免 `__ac` 的页面备选；App feed 实测最高 720p，只作最后兜底（2.8）。
 3. **其他 `filter_reason`**：遇到已删除、私密、地区限制的视频时，补充对应的 `filter_reason` 取值和页面表现。
+4. **fork 尚不支持的内容**：图集（`/note/`、`/slides/`）、LivePhoto、音乐、合集、放映厅 / 短剧。
+   open API 对图集是否返回 `images` 与 LivePhoto 的 `images[i].video` 未测，可用 media-parser 样本清单里的真实作品 ID 测。
+5. **疑点（只读代码，未实测）**：
+   - 字幕：`DouyinIE` 沿用 TikTok 的 `cla_info` 字段名（`lang` / `Format`），可能与抖音实际字段不符；
+     找不到字幕且有作者名时会用 TikTok 的 `_create_url` 去请求 tiktok.com 页面（只在 `--write-subs` / `--list-subs` 时触发）；
+   - fork 自己生成 `verify_` 开头的 `s_v_web_id`，与 media-parser「普通作品带它会 403」的说法相反，需要 A/B；
+   - 用户 `--cookies-from-browser` 带入的 `bd_ticket_guard*` 等字段是否影响 web API（media-parser 称会触发 `Signature Not Found`）。
+6. **原片**：`ratio=default` 是否总是原片、长期是否可用，只在 3 个视频上验证过；ext 固定为 mp4，而原片可能是 QuickTime 容器。
 4. **`webid`**：目前两个 API 策略都不带 `webid`；将来若加上，注意 amagi 发现的「`webid` 与会话不匹配则 200 空响应」。
