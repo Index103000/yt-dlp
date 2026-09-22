@@ -2,7 +2,7 @@
 
 - 调研时间：2026-09-21；2026-09-22 补充 Argus 签名实测、上传原片、短链与分享链接、与 media-parser 的对比，
   同日实现 web API 签名（改为第一级）、原片探测，并调研 TikTok 原片；当晚策略改名为 `signed_web_api` / `embed_origin_api` /
-  `ssr_render_data`，原片改为 `original=true` 时才列出、按分辨率排序并默认探测
+  `ssr_render_data`，原片改为 `original=true` 时才列出、按分辨率排序并默认探测；2026-09-23 修正 API 路径水印版 `download_addr` 的排序与宽高
 - 适用分支：`tiktok`
 - 对应代码：`yt_dlp/extractor/tiktok.py`（`DouyinIE`、`TikTokBaseIE._extract_web_formats`）、`yt_dlp/extractor/tiktok_utils/douyin/*`
 
@@ -54,6 +54,8 @@ Python API 里每个值都要写成字符串列表，如 `{'douyin': {'original'
 - 支持的链接：`www.douyin.com/video/<id>`、任意路径上的 `?modal_id=<id>`、`iesdouyin.com` / `m.douyin.com` 的 `/share/video/<id>`、
   `v.douyin.com/<code>` 短链（见 2.10）。图集、音乐、合集等不支持。`webpage_url` 统一为 `https://www.douyin.com/video/<id>`。
 - `original=true` 时额外列出上传原片 `original` 并默认选中它，见 2.9。
+- 水印版在三条策略下都排在所有转码档之下（`preference=-2`），`-f worst` 选中它；格式 ID 在 API 两级是 `download_addr`
+  （多镜像时 `download_addr-0/1/2`）、在 SSR 方案是 `download`，排除它要写 `[format_id!^=download]`，见 2.12。
 - 另有 App feed 接口也能绕开 Argus，但实测最高只有 720p，未接入，见 2.8。
 
 ------
@@ -403,6 +405,48 @@ User-Agent: com.ss.android.ugc.aweme/300904 (Linux; U; Android 12; zh_CN; SM-G97
 - 响应里有 `is_oversea` 字段（国内为 0），海外表现未测；
 - 结论：门槛比精选页低（免 `__ac`），数据比精选页少（没有码率阶梯），可作为 SSR 方案失效时的备选。
 
+### 2.12 水印版 download_addr 的排序（API 路径，2026-09-23 修正）
+
+`signed_web_api` / `embed_origin_api` 的格式由 `_parse_aweme_video_app` 生成（与 TikTok 共用，本地跟踪的上游 master `c7fb478`〔2026-09-16〕代码相同），
+其中 `video.download_addr` 是水印版（`format_note` 为 `Download video, watermarked`）。这段代码有两个问题：
+
+- **preference 被覆盖**：调用处传入 `'preference': -2 if has_watermark else -1`，但 `extract_addr` 在展开 `**add_meta` 之后又写了
+  `'preference': -100 if is_bytevc2 else -1`，水印版实际为 -1，与转码档同级。默认排序下它没有 `quality`（没有 UrlKey），仍排在最后，
+  所以默认选择和 `-f worst` 看不出问题；但 `-S res`、`-S size` 等用户规则排在 `preference` 之后、`quality` 之前，会选中它。
+- **宽高是假的**：17 个样本的 `download_addr.width/height` 全是 720x720，与视频实际分辨率（320x240 到 2560x1440）无关；
+  代码取宽 720、高按视频宽高比推算（原注释已说明 height 不对），于是 320x240 的 7684908169365914597 被标成 720x540，
+  1440x2560 的被标成 720x1280。水印版文件的真实分辨率没有下载核实。
+
+17 个样本里的其他事实：
+
+- `video.has_watermark` 与 `download_addr` 地址里的 `watermark=1` / `0` 17/17 一致。唯一为 `false` 的 7686096925641338809 是 `watermark=0`，
+  `data_size` 与 `play_addr` / `normal_1080_0` 完全相同，是无水印转码。
+- 16 个水印版里有 7 个的 `data_size` 恰好等于某个 H.264 转码档（`normal_540_0`、`normal_720_0`，7684908169365914597 为 360p 的
+  `play_addr_h264`），两者关系未下载核实，不据此推宽高。
+- 9 个视频的水印版比所有转码档都大（7686432847778982833：21.9MB，最大转码档 `normal_1080_0` 16.4MB；7615828879340552036：170.8MB 对 157.6MB）。
+
+修正（`DouyinIE._build_douyin_api_info`，不改共用的 `extract_addr`）：`format_id == 'download_addr'` 的格式去掉宽高，
+`has_watermark` 为真时设 `preference=-2`（与 SSR 方案、TikTok 网页路径的 `download` 一致），无水印的保持 -1。
+TikTok 走 App API 的路径（`_extract_aweme_app`，以及 Sound / Effect / Tag 列表）用的是同一段代码，理论上同样受影响；
+其中 `_extract_aweme_app` 目前不可用（2.7），列表类未测，所以没改共用代码。
+
+回归（离线：17 个视频 × 原片 4 种状态〔不列 / 探测 / 不探测 / 探测首请求失败〕× `-S`〔无 / `res` / `+size` / `size` / `vcodec:h264`〕
+× `format_sort_force` 开关，共 680 组）：
+
+| 场景 | 改动前 | 改动后 |
+| --- | --- | --- |
+| 默认排序：默认选择、`b`、`bv*`、`wv*`、`-f worst`（force 开关都一样） | — | 全部不变；`-f worst` 各 68/68 仍是 `download_addr`（7686096925641338809 的是无水印版） |
+| `-S res`（force 开关都一样） | 7684908169365914597 选中水印版（标 720x540） | 选 `bytevc1_360p`（320x240）；列原片且探测成功或不探测时选原片 |
+| `-S size`（force 关） | 9 个视频选中水印版 `download_addr-2`（如 7686432847778982833 的 21.9MB） | 选最大的转码档（该视频为 16.4MB 的 `normal_1080_0`）；原片探测成功时仍选原片 |
+| `-S +size`、`-S vcodec:h264` 的默认选择 | — | 不变 |
+| 有用户 `-S` 时（force 关）的 `-f worst` / `wv*` | 按该规则排最后的格式（转码档，或列出时的原片） | 水印版（`preference` 排在用户规则之前），与 SSR 方案一致 |
+| `format_sort_force=True` + `-S res` 的 `-f worst` / `wv*` | 最低分辨率的转码档 | 水印版（宽高未知，按最低） |
+| `format_sort_force=True` + `-S size` | 上述 9 个视频选中水印版 | **不变**：force 让用户规则越过 `preference`，而水印版确实最大；不篡改 `filesize` 就无法避免，要排除请加 `[format_id!^=download]` |
+| `has_watermark=false` 的 7686096925641338809 | — | 全部不变 |
+
+格式筛选：`[format_id!=download]` 只排除 SSR 方案与 TikTok 网页路径的 `download`，匹配不到 API 两级的 `download_addr` / `download_addr-N`
+（680 组里 479 组的 `worst[format_id!=download]` 仍选中它）；`[format_id!^=download]` 在各条路径下都能排除（680/680）。
+
 ------
 
 ## 3. 排查方法
@@ -513,6 +557,8 @@ for i in range(5):
   Windows 下载机同理：它从 `.venv\Lib\site-packages` 导入已安装的 yt_dlp，更新代码后要重新安装才生效。
 - 格式选择改动（如新增格式）要回归 `-f worst` / `wv*` 等，不只看默认选择：可以把保存的 `aweme_detail` / 精选页 HTML
   喂给 `_real_extract`（monkeypatch 网络函数）离线比对新旧选择结果。
+  还要带上 `-S res` / `-S size` 与 `format_sort_force=True`：用户 `-S` 排在 `preference` 之后、`quality` 之前（force 时越过 `preference`），
+  2.12 那类 `preference` 或宽高错误在默认排序下看不出来。
 
 ------
 
