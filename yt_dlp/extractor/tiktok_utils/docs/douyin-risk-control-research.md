@@ -294,6 +294,48 @@ https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=<id>&aid=6383&msToken
   失败再去掉重试。本 fork 尚未移植；要先用业务机的样本（视频 ID + 当时的 info.json + 出口 IP）复现，再决定用 `--xff US`、Cookie 还是移植 #15710。
   本文 2.7 开头「美国与巴西出口档位一致」是 2026-09-22 对 4 个视频的一次观察，与 #15690 的间歇性并不矛盾。
 
+#### 2.7.1 已接入 signed_web_api 第二渠道（2026-09-23）
+
+用户要求：即使各渠道拿到的最高档位相同，也要给 TikTok 增加第二个数据渠道做冗余，一条坏了另一条可能还能用。
+`TikTokIE._real_extract` 改成与 `DouyinIE` 同样的策略循环，`--extractor-args "tiktok:strategies=..."` 控制，默认
+`webpage_hydration,signed_web_api`（配置写法与日志见 README「TikTokIE 的两条渠道」）。
+
+- **端点**：`GET https://www.tiktok.com/api/item/detail/?<业务参数>&X-Dynosaur=...&msToken=&X-Bogus=1&X-Gnarly=...`，
+  响应 `itemInfo.itemStruct` 与页面 hydration 的 `webapp.video-detail.itemInfo.itemStruct` 同结构，直接交给 `_parse_aweme_video_web`。
+- **签名来源与许可证**：`tiktok_utils/tiktok/websign.py` 移植自 Evil0ctal/Douyin_TikTok_Download_API `src/dtk/signing/native/tiktok_sign.py`
+  @ e02c0f3f5（2026-09-11，Apache-2.0，仅标准库），文件头保留出处与许可证声明，算法与常量未改；JoeanAmier 的改编版是 GPL-3.0，未放进仓库。
+  原仓库 `tests/unit/test_signing.py` 的 6 组 TIKTOK_VECTORS（Node 跑真 webmssdk 2.0.0.561 得到）与浏览器抓包常量校验放在
+  `test/test_tiktok_utils_websign.py` + `test/testdata/tiktok/websign_vectors.json`，X-Dynosaur / X-Gnarly 12/12 逐字节复现。
+- **参数**（`tiktok_utils/tiktok/api.py`，Evil0ctal v5 `base_params` + `itemId`，加 `user_is_login=false`）：`aid=1988`、`app_name=channel=tiktok_web`、
+  `browser_name=Mozilla`、`browser_version=5.0 (Macintosh)`、`browser_platform=MacIntel`、`os=mac`、`device_platform=web_pc`、`device_id`（`tiktok:device_id`
+  或与列表接口相同的随机 19 位数）、`region=priority_region=US`、`tz_name=America/New_York`、`screen_*`、`webcast_language=en`、`root_referer=https://www.tiktok.com/`、
+  `msToken` 留空（不伪造）；请求头 UA（Mac Chrome 146，与签名里的 UA 哈希一致）、`Referer: https://www.tiktok.com/`、`Origin`；无 Cookie、
+  默认不做 TLS 伪装（不依赖 curl_cffi，全局 `--impersonate` 时随之；与网页路径的封锁面基本独立）。签名后的 URL 原样发送，不经 `query=` 重新编码。
+- **下载地址**（2026-09-23 实测，`mp_work9/live-mac`、`mp_work9/refute_cdn403`、`mp_work10`）：接口返回的每档 `UrlList` 有 3 个地址
+  `v16-webapp-prime` / `v19-webapp-prime` / `www.tiktok.com/aweme/v1/play`。直连的前两个在这条渠道下下载一律 403（Varnish）：
+  不带 Cookie 4/4；带首页 HEAD 下发的 `ttwid` / `tt_csrf_token` / `tt_chain_token` 仍 403；带网页渠道会话的 Cookie 去请求接口、再用同一会话下载也 403；
+  而网页渠道自己的 `v19` 地址带其会话 Cookie 是 206（对照）。`www.tiktok.com/aweme/v1/play` 镜像则**无 Cookie 也 206**（302 到 `v16m-default.tiktokcdn-us.com`，
+  `adapt_lowest_1080_1` 与 `normal_540_0` 各 1 次，10241 字节 `video/mp4`）。所以 signed_web_api 渠道每档只保留镜像地址，直连地址去掉，
+  没有镜像的水印版 `download` 不列出（`_extract_web_formats` 的 `_tiktok_play_mirror_only`）。镜像 2024-09 曾返回 HTML 页面（上游 issue 11034，
+  网页渠道因此过滤它），所以标 `__needs_testing`，yt-dlp 选中前先探一次。最初的实现只做了 `-J` 没做下载验证（3.3 早有「只列格式发现不了下载阶段的 403」），
+  由独立复核发现。
+- **需登录的判定**：`statusCode` 0 但 `itemStruct` 没有 `video` 且 `isContentClassified: true`（如 `ContentClassificationReason 209007`，
+  样本 @jacob__knowles/7279901785777573166）= 敏感内容需登录，两条渠道同抛登录提示、不回退（最初只在网页渠道判定，复核发现后抽成共用方法）。
+  视频页 302 到 `/login` 则作为可回退原因（多是页面级风控，不是内容需登录）。
+- **判据**（写进失败原因，除最后一级外都回退）：非 200 → `HTTP <码>: <响应体摘要>`；200 空 body + 响应头 `tt_orcas_res: 1` →
+  `signature or device rejected (tt_orcas_res=1)`（device_id 缺失或 X-Dynosaur 无效，含 SDK 升版本导致的常量失效）；`statusCode 10000` → `verification required`；
+  无 `itemStruct` → `no itemStruct in response`。`statusCode` 10216 / 10222 / 10204 / 其他非 0 与网页路径同义，直接报错不回退。
+  网页路径的失败原因同步补了响应特征：`Unexpected response from webpage request (HTTP 200, 612 bytes, blocked by risk control (X-TT-System-Error: 3))`。
+- **请求数**：signed_web_api 每个视频 1 个接口请求，下载前对选中的镜像格式探 1 次（`__needs_testing`），镜像 302 再 1 次；
+  默认顺序下网页成功时不请求 API，网页失败才多 1 个。
+- **实测**（本机美国出口，`--ignore-config --proxy "" --no-cookies`）：`-J` 两条路径各 4 个样本（willsmith/7474304960574786859、alex_selekos/7645243669045382422、
+  hankgreen1/7047596209028074758、@/7099120109842713899）4/4 成功，`(format_id, filesize, width, height, vcodec, tbr, fps, quality)` 逐档一致，标题 / 作者 / 计数一致；
+  `strategies=signed_web_api --test` 实际下载 willsmith / hankgreen1 / 7099120109842713899 3/3 成功（每个视频：接口 1 次 → 探测镜像 302+206 → 下载 302+206，落盘 10241 字节），
+  默认路径 `--test` 对照 206（`mp_work10/acc_*.out`）。`DataSize` 页面是字符串、API 是整数，`formats.py` 的 `int_or_none` 兼容，未改共用逻辑。
+  实现者首轮对 tiktok.com 发了 24 次请求（有效 8 次，其余是 shell 循环把 URL 少写 `/video/` 落到 generic extractor），超出单 agent 15 次的上限，
+  记录在 `mp_work9/implement/cli_run_wrong_urls.log`。
+- **未验证**：业务机（电信出口）上「页面降档而 API 不降」是否成立（2.13.2.3 第 3 步）；签名常量的时效（JoeanAmier 2026 上半年整体失效的先例）。
+
 ### 2.8 App feed（未接入，仅实测）
 
 抖音手机 App 的推荐流接口，即 App 里上下刷视频时拉取视频列表的接口（方案来自 4. 参考项目中的 Diana、media-parser）：
@@ -558,11 +600,13 @@ TikTok 走 App API 的路径（`_extract_aweme_app`，以及 Sound / Effect / Ta
   `_solve_challenge_and_set_cookies` / `get_webpage(headers=, impersonate=)` 手工改写）。**不默认开启**：#15710 自己列的三个副作用，加上 fork 已带随机头 + 伪装，
   再叠 XFF 会让指纹更独特（#17437 讨论）。业务机配置里显式写开关即可。
 - **结果「页面降、API 不降」**：引入 Evil0ctal `src/dtk/signing/native/tiktok_sign.py`（Apache-2.0，仅标准库；JoeanAmier 的改编版是 GPL-3.0，不要用它）作第二路径，
-  页面路径失败或档位不含 1080 时再请求 `/api/item/detail/`。注意：`DataSize` 类型（`int_or_none` 兜两种）、少掉的键（challenges / textExtra / comments 等，取 formats 够用）、
+  页面路径失败或档位不含 1080 时再请求 `/api/item/detail/`。**已实现（2026-09-23，见 2.7.1）**：按用户要求不等业务机排查结果，直接接入为
+  `tiktok:strategies` 的 `signed_web_api`，默认顺序 `webpage_hydration` → `signed_web_api`，页面失败才请求 API；「档位不含 1080 时也请求」未做（两条渠道档位一致，做了也无益）。注意：`DataSize` 类型（`int_or_none` 兜两种）、少掉的键（challenges / textExtra / comments 等，取 formats 够用）、
   UA 必须与签名时一致（X-Dynosaur 含 UA 哈希）、只校验 X-Dynosaur 所以 X-Gnarly 正确性只能靠离线向量（Evil0ctal `tests/unit/test_signing.py` TIKTOK_VECTORS）。
 - **无论哪种结果都值得做的零风险项**：
-  - 诊断日志：网页响应带 `X-TT-System-Error: 3` 时打「被风控拦截（不是视频不可用）」；`/api/item/detail/` 路径若引入，200 空 body + `tt_orcas_res: 1` 打「设备 / 签名被拒」；
-  - 文档 3.1 加 TikTok 行（上述两条 + `Impersonation target` 检查项）；文档 2.7 补 06ab8f6a（hvc1 无声档已处理）与 #16532（540→576 硬映射）说明。
+  - 诊断日志：网页响应带 `X-TT-System-Error: 3` 时打「被风控拦截（不是视频不可用）」；`/api/item/detail/` 路径若引入，200 空 body + `tt_orcas_res: 1` 打「设备 / 签名被拒」
+    —— **已实现**（`blocked by risk control (X-TT-System-Error: 3)` / `signature or device rejected (tt_orcas_res=1)`，3.1）；
+  - 文档 3.1 加 TikTok 行（上述两条 + `Impersonation target` 检查项）—— **已实现**；文档 2.7 补 06ab8f6a（hvc1 无声档已处理）与 #16532（540→576 硬映射）说明 —— 未做。
 - **风险清单**：XFF → 503 / 10101 / 验证码页、指纹更独特；Cookie → 账号风控、且无证据有效；第二路径 → 签名常量时效、请求数翻倍；
   任何默认行为改动都会影响业务机的稳定流水线，先开关后默认。
 
@@ -687,6 +731,16 @@ TikTok 走 App API 的路径（`_extract_aweme_app`，以及 Sound / Effect / Ta
 | `WARNING: [Douyin] Douyin original format is listed without probing (original_probe=false) ...` | `original=true` + `original_probe=false` 且输出 info JSON，整次运行打印一次 |
 | `Unknown Douyin strategies: 'web' (available: ...)` / `Unknown Douyin original_probe value: 'size'; write douyin:original_probe=true ...` / `Douyin extractor arg ... must be a list of strings` | 配置写错：旧策略名 `web` / `open` / `webpage`、`original_probe` 的旧取值 `none` / `size` / `full`（现为 `true` / `false`，原 `full` 即 `true`）、Python API 把值写成字符串或布尔值；在任何请求之前报出 |
 | `Douyin short link is invalid or expired` / `points to an unsupported page` | 短码失效，或短链指向图集、西瓜视频等（2.10） |
+| `TikTok webpage_hydration failed: Unexpected response from webpage request (HTTP 200, 612 bytes, blocked by risk control (X-TT-System-Error: 3))` | TikTok 网页被风控拦截页（不是视频不可用，#15644 / #17393 的判据），已自动回退到 `signed_web_api`；先看 `[debug] [TikTok] Impersonation target:` 与 curl_cffi 版本（#17604 chrome-150 被封） |
+| `TikTok webpage_hydration failed: Unable to solve JS challenge (...)` / `Unable to extract universal data for rehydration (...)` / `no itemStruct in webpage hydration data` | WAF 挑战没解出、页面没有 hydration 数据或结构变了，括号里是 HTTP 状态码与页面大小；已回退到 `signed_web_api` |
+| `TikTok webpage_hydration failed: Unable to download webpage: HTTP Error 403: Forbidden` | 网页路径的 HTTP 错误原样透传（TLS 指纹 / IP 被拒等），已回退 |
+| `TikTok webpage_hydration failed: TikTok is requiring login for access to this content. ...` | 视频页 302 到 `/login`，多为对可疑 IP 的页面级风控，已回退到 `signed_web_api`；内容真需登录时是 `statusCode` 10216 / 10222 或 `isContentClassified`，那两种不回退 |
+| `TikTok signed_web_api failed: HTTP 200 with empty body: signature or device rejected (tt_orcas_res=1)` | `/api/item/detail/` 判定 device_id 缺失或 X-Dynosaur 无效：多半是 TikTok webmssdk 升版本让 `tiktok/websign.py` 的常量（ENV_CODE / UB_CODE / SDK_VERSION / SCM_VERSION）失效，对照 Evil0ctal 上游更新并跑 `test/test_tiktok_utils_websign.py` |
+| `TikTok signed_web_api failed: verification required (statusCode 10000)` | 验证信封（风控要求验证），已回退；不是视频不可用 |
+| `TikTok signed_web_api failed: HTTP <码>: ...` / `non-JSON response: ...` / `no itemStruct in response` | 端点返回错误页 / 验证码页 / 结构变化，已回退 |
+| `Unable to extract TikTok video info. webpage_hydration: ...; signed_web_api: ...` | 两条渠道都失败，分号分隔各自原因 |
+| `Your IP address is blocked from accessing this post` / `You do not have permission to view this post...` / `Video not available, status code N` | 服务端明确说不可用（10204 / 10216 / 10222 / 其他非 0 statusCode），两条渠道同义，不回退 |
+| `Unknown TikTok strategies: 'foo' (available: webpage_hydration, signed_web_api)` / `TikTok extractor arg strategies must be a list of strings` | `tiktok:strategies` 配置写错，在任何请求之前报出 |
 
 ### 3.2 判断抖音看到的出口 IP
 
@@ -831,7 +885,7 @@ TikTok 方向 2026-09-23 跨项目调研新增的参考项目（yt-dlp 上游各
    - 回退为转码档的规律不清楚（2021 年视频 4 个中 1 个），`te_is_reencode`、`transType`、`isFastImport` 等剪辑器标签的含义未核实；
    - 旋转：`mp4probe` 按 `tkhd` 矩阵换算显示宽高，ffmpeg 合成的 90° 样本结果正确，但抖音原片样本里没有带旋转矩阵的，真实文件未验证；
    - 海外出口的原片被调度到 `v5-dy-ov-experiment.zjcdn.com`，曾出现一次 TLS 建连失败（换出口后成功），偶发性未量化。
-4. **TikTok**：业务机「1080p→540p」的分型与缓解（XFF US、`/api/item/detail/` 第二路径、换出口）只能在业务机上按 2.13.2.3 排查，本机出口是美国测不了；
+4. **TikTok**：第二渠道 `signed_web_api` 已接入（2.7.1），但它对「1080p→540p」是否有效未验；业务机「1080p→540p」的分型与缓解（XFF US、`/api/item/detail/` 第二路径、换出口）只能在业务机上按 2.13.2.3 排查，本机出口是美国测不了；
    完整的未解决清单见 2.13.6。登录 Cookie「稳定 1080p」的说法复核不成立（2.13.2.1），只保留为实验项；签名 App API 在开源侧没有可用实现（2.13.4），
    若将来恢复，先看是否仍下发 `original_*` / `quality_type 10000`（上游 issue 7109）。
 5. **其他 `filter_reason`**：遇到已删除、私密、地区限制的视频时，补充对应的取值和页面表现；
