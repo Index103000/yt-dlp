@@ -281,11 +281,17 @@ https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=<id>&aid=6383&msToken
 - 第三方：tikwm 的 `hdplay` / `hd_size` 等于 yt-dlp web 最高档；tikdownloader 的「MP4 HD」（tokcdn `…_original.mp4`）
   有时像上传原片（QuickTime、moov 在尾、码率高出数倍）、有时只是更高的转码档、有时与 web 档相同，同一视频还会随时间变化，
   来源不明且需把链接交给第三方，不集成。web 最高 1080 档都叫 `adapt_lowest_1080_1`，App 端可能有更高档，未证实。
-- **用户感到的「降码率」有一部分来自默认排序**：yt-dlp 默认同分辨率下按编码优先选 HEVC，而 web 的 HEVC 档码率常只有同分辨率
-  H.264 档的 1/3。hankgreen1 576x1024：默认 HEVC 668k 的 VMAF 92.09，H.264 1895k 为 98.58（以 tokcdn 高码率文件为参考）。
-  已在 `_parse_aweme_video_web` 设 `'_format_sort_fields': ('quality', 'res', 'size', 'br')`（去掉 codec，同分辨率时体积大的优先）；
-  5 个样本中只有 hankgreen1 的默认选择改变，`-f worst` / `wv*` 不变；app 路径的排序未改。用户侧也可临时用 `-S res,size`。
-- 未测：登录态 Cookie（sid_tt 等）下 web 是否给出更高的 1080 档（上游 #15690 有人称带 Cookie 能稳定拿到 1080p）。
+- 默认排序的一个观察（**不改代码**）：yt-dlp 默认同分辨率下按编码优先选 HEVC，而 web 的 HEVC 档码率常只有同分辨率 H.264 档的 1/3。
+  hankgreen1 576x1024：默认 HEVC 668k 的 VMAF 92.09，H.264 1895k 为 98.58（以 tokcdn 高码率文件为参考）。
+  2026-09-22 曾在 `_parse_aweme_video_web` 设 `'_format_sort_fields': ('quality', 'res', 'size', 'br')`，次日按用户要求撤回：
+  排序走 yt-dlp 默认逻辑，由用户在配置里用 `-S`（如 `-S res,size`）决定，extractor 不改默认选择。
+- **用户业务中的真实问题（2026-09-23 提出，待复现）**：同一批 TikTok 视频前几天还能下到 1080p，最近只有 540p，即服务端下发的档位变少。
+  上游 [#15690](https://github.com/yt-dlp/yt-dlp/issues/15690)（2026-01-26，仍 open）记录了同类现象：非美国 IP（英国、日本代理、其他）
+  有时只给 `play` 一档、或缺 `bytevc1_1080p`，且每次运行结果不同；`--xff US` 后多档稳定出现；一位报告者带自己的 Cookie 时不论 IP 都能稳定
+  拿到 1080p；`--xff US` 偶发 503 与验证码页；三天后几位报告者都不能复现，说明是间歇性的服务端策略。
+  上游 PR [#15710](https://github.com/yt-dlp/yt-dlp/pull/15710)（bashonly，2026-01-27，未合并，作者自认写法不满意）默认带 `X-Forwarded-For` 美国地址，
+  失败再去掉重试。本 fork 尚未移植；要先用业务机的样本（视频 ID + 当时的 info.json + 出口 IP）复现，再决定用 `--xff US`、Cookie 还是移植 #15710。
+  本文 2.7 开头「美国与巴西出口档位一致」是 2026-09-22 对 4 个视频的一次观察，与 #15690 的间歇性并不矛盾。
 
 ### 2.8 App feed（未接入，仅实测）
 
