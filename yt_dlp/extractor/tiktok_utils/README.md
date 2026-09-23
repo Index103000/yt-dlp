@@ -159,6 +159,84 @@ tiktok_utils/douyin/render_data.py
 链接除 `/video/<id>`、`?modal_id=` 外，还支持 `iesdouyin.com` / `m.douyin.com` 的 `/share/video/<id>` 与 `v.douyin.com` 短链；
 `webpage_url` 统一为 `https://www.douyin.com/video/<id>`。
 
+### extractor-args 配置示例（带注释）
+
+Python API 写法（命令行等价写法见末尾）。每个值都必须是「字符串列表」，写成字符串会被拆成单个字符（`'true'` → `t`、`r`、`u`、`e`），
+写成布尔值也会报错；两种写法都在发出任何请求之前报出可读错误。值不区分大小写。
+
+```python
+'extractor_args': {
+    # 键名是小写 douyin，只对抖音生效，不影响 TikTok / YouTube 等其他 extractor
+    'douyin': {
+
+        # ── 提取策略，按顺序依次尝试，前一个失败才用下一个 ──────────────────────────────
+        # 可选值（任意组合，顺序即尝试顺序；重复去重，空值按默认）：
+        #   signed_web_api   网页端接口 aweme/v1/web/aweme/detail + a_bogus。被 Argus 拦截（403 Uifid Not Found）时
+        #                    自动取 uifid（浏览器 Cookie UIFID → UIFID_TEMP → yt-dlp 缓存 → 请求精选页取新的）
+        #                    并按 x-secsdk-web-signature 算法签名重试。不依赖任何白名单口子，所以排第一。
+        #                    被拦的 IP 上第一个视频 5 个请求，之后每个 1 个；未被拦的 IP 2 个。
+        #   embed_origin_api 同一接口，但 Origin 伪装成官方嵌入播放器的 open.douyin.com，服务端按白名单跳过校验。
+        #                    1 个请求，但这是利用口子，随时可能被堵，只作兜底。
+        #   ssr_render_data  精选页 jingxuan?modal_id= 服务端渲染出的 RENDER_DATA，依赖 __ac_nonce / __ac_signature。
+        #                    格式档位比 API 少（约 12–15 档 vs 70 档），最高画质相同。
+        # 默认：['signed_web_api', 'embed_origin_api', 'ssr_render_data']
+        # 只写一个时，它失败就直接报错，不会退到其他策略；适合单独验证某条路径。
+        # 旧名 web / open / webpage（2026-09-22 下午的版本）已废弃，传入会报错并列出新名字。
+        # 每级失败打印 WARNING「Douyin <策略名> failed: <原因>」，全部失败时报错汇总各级原因；
+        # 视频不存在（filter_reason）时直接报错，不再尝试后续策略。
+        'strategies': ['signed_web_api', 'embed_origin_api', 'ssr_render_data'],
+
+        # ── 是否列出上传原片 original ──────────────────────────────────────────────────
+        # 可选值：'true' / 'false'。默认 'false'：格式列表里没有 original，行为与以前完全一致。
+        # 'true'：额外列出 format_id='original'（/aweme/v1/play/?ratio=default），即作者上传的未转码文件：
+        #   - 实测 17 个视频中 16 个是真原片，码率为最高转码档的 2.8–10.3 倍，分辨率、帧率不低于任何转码档；
+        #   - 编码 / 容器随上传文件而定：多为 HEVC + MOV（.mov），也有 H.264 + MP4，偶有 HLG 10bit HDR；
+        #   - 它按分辨率归档，排在同分辨率转码档之上，因此【成为默认选择】；-S 排序规则同样作用于它；
+        #     -f worst 仍是水印版，不受影响；
+        #   - 三条策略下都能拿到，与 strategies 的取值无关；
+        #   - 老视频的原片可能已被清理，此时服务端悄悄返回转码档（17 个中 1 个），探测开启时会识别并去掉；
+        #   - 原片的下载请求不带 Referer（冷存储节点 v96-hcc 带 Referer 会 403），转码档仍带，无需自己处理。
+        # 后续上传 / 转码环节要能处理 .mov 和 HEVC。
+        'original': ['true'],
+
+        # ── 原片是否在下载前探测 ────────────────────────────────────────────────────────
+        # 可选值：'true' / 'false'。默认 'true'。只在 original=true 时有意义。
+        # 旧值 none / size / full 已废弃（原 full 即 true），传入会报错。
+        # 'true'：多发 3 个 HTTP 请求（302 跳转、文件头 4KB、文件尾 moov），国内直连每个视频多约 0.2–0.6 秒，
+        #   海外代理多约 10–20 秒。得到：
+        #   - 精确 filesize、tbr（平均码率）、ext（mov / mp4）、vcodec、acodec、fps、vbr、abr、dynamic_range（SDR / HDR10 / HLG）；
+        #   - 识别「假原片」（ratio=default 其实返回了转码档）并去掉，避免下错；
+        #   - 探测的第一个请求失败时，原片保留但降到所有转码档之下、不作为默认，并打印 WARNING；
+        #     只有 moov 读取失败时保留大小 / 码率 / 容器，缺编码与 fps，同样打印 WARNING。
+        # 'false'：不多发请求，但只知道宽高：
+        #   - vcodec 未知，best[vcodec!=none] 这类筛选会把原片排除（要放行需写 vcodec!=?none）；
+        #   - -S vcodec / -S size 等规则对它无效；QuickTime 原片会被存成 .mp4；识别不了假原片；
+        #   - 若同时输出 info.json（--write-info-json / -j / -J），整次运行打印一次 WARNING 提示元数据不全
+        #     （设置了自定义 logger 时 yt-dlp 不去重，每个视频一次）。
+        'original_probe': ['true'],
+    },
+},
+```
+
+与之相关的两个 yt-dlp 通用选项：
+
+```python
+# 缓存目录：signed_web_api 取到的 UIFID_TEMP 会存在 <cachedir>/douyin/uifid.json，下次运行直接复用
+# （实测可复用至少 24 小时，跨视频、跨 IP）。cachedir=False（即 --no-cache-dir）则每次运行都重新取，
+# 被拦的 IP 上每次多 3 个请求。
+'cachedir': './yt_dlp_cache',
+
+# 格式选择器：抖音 API 路径的水印版 format_id 是 download_addr / download_addr-N，
+# [format_id!=download] 排除不掉它，要用 !^=（不以 download 开头），三条策略下都有效。
+'format': 'bestvideo+bestaudio/best[vcodec!=none][format_id!^=download]',
+```
+
+命令行等价写法，多个键之间用 `;` 分隔：
+
+```bash
+yt-dlp --extractor-args "douyin:strategies=signed_web_api,embed_origin_api,ssr_render_data;original=true;original_probe=true" "https://www.douyin.com/video/<id>"
+```
+
 ## TikTok 网页路径的排序
 
 TikTok 拿不到上传原片（`/aweme/v1/play` 已要求 `file_id` + 签名，`ratio` 被忽略），能拿到的最好文件就是 web 的最高档。
