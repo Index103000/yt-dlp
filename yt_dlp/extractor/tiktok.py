@@ -47,6 +47,10 @@ from .tiktok_utils.formats import (
     normalize_bytedance_vcodec,
     parse_bytedance_url_key,
 )
+from .tiktok_utils.tiktok.api import (
+    build_item_detail_headers,
+    build_item_detail_url,
+)
 from ..networking import HEADRequest, Request
 from ..utils import (
     ExtractorError,
@@ -142,6 +146,52 @@ class TikTokBaseIE(InfoExtractor):
     @staticmethod
     def _create_url(user_id, video_id):
         return f'https://www.tiktok.com/@{user_id or "_"}/video/{video_id}'
+
+    def _list_extractor_arg(self, key, default):
+        """
+        读 --extractor-args "<ie_key>:<key>=..."（TikTokIE 为 tiktok:、DouyinIE 为 douyin:），返回小写字符串列表；没配置时返回 default。
+
+        Python API 里每个值都必须是字符串列表：写成字符串会被 _configuration_arg 拆成单个字符（'true' → t、r、u、e），
+        写成 [True] 会在转小写时抛 AttributeError、写成 True 会在 list() 时抛 TypeError，这里提前报出可读的错误。
+        """
+        value = traverse_obj(self._downloader.params, ('extractor_args', self.ie_key().lower(), key))
+        if value is not None and (
+                not isinstance(value, (list, tuple)) or not all(isinstance(item, str) for item in value)):
+            raise ExtractorError(
+                f'{self.IE_NAME} extractor arg {key} must be a list of strings, e.g. {{"{key}": ["..."]}}; got {value!r}',
+                expected=True)
+        return self._configuration_arg(key, default)
+
+    def _parse_strategies_arg(self, available):
+        """
+        解析 --extractor-args "<ie_key>:strategies=..."：重复去重、空值按默认顺序（available）、未知名字在任何请求之前报错。
+        """
+        strategies = list(dict.fromkeys(filter(None, self._list_extractor_arg('strategies', []))))
+        strategies = strategies or list(available)
+        if unknown := [strategy for strategy in strategies if strategy not in available]:
+            raise ExtractorError(
+                f'Unknown {self.IE_NAME} strategies: {", ".join(map(repr, unknown))} '
+                f'(available: {", ".join(available)})', expected=True)
+        return strategies
+
+    def _check_tiktok_status(self, status, video_id):
+        """
+        按上游语义处理 webapp.video-detail / api/item/detail 的 statusCode，两条渠道共用。
+
+        返回 None 表示正常（0 或缺失）；返回字符串表示可回退到其他渠道的原因（10000 是验证信封，属风控而非视频不可用）；
+        其他非 0 值是服务端明确说不可用（需登录 / IP 被封 / 视频不存在），直接抛出 expected 错误、不再尝试其他渠道。
+        """
+        if not status:
+            return None
+        if status == 10000:
+            return 'verification required (statusCode 10000)'
+        if status in (10216, 10222):
+            # 10216: private post; 10222: private account
+            self.raise_login_required(
+                'You do not have permission to view this post. Log into an account that has access')
+        if status == 10204:
+            raise ExtractorError('Your IP address is blocked from accessing this post', expected=True)
+        raise ExtractorError(f'Video not available, status code {status}', expected=True, video_id=video_id)
 
     def _get_sigi_state(self, webpage, display_id):
         return self._search_json(
@@ -311,6 +361,18 @@ class TikTokBaseIE(InfoExtractor):
     def _extract_web_data_and_status(self, url, video_id, fatal=True):
         video_data, status = {}, -1
         headers = self._generate_blockbuster_headers()
+        # 最近一次网页响应 [webpage, urlh]：失败原因里附上状态码 / 大小 / 是否被风控拦截（X-TT-System-Error: 3，
+        # 见调研文档 2.13.3），让 TikTokIE 回退到下一渠道时日志能定位是被拦截还是页面结构变了
+        last_response = []
+
+        def response_detail():
+            if not last_response:
+                return None
+            webpage, urlh = last_response
+            detail = [f'HTTP {urlh.status}', f'{len(webpage)} bytes']
+            if urlh.headers.get('X-TT-System-Error') == '3':
+                detail.append('blocked by risk control (X-TT-System-Error: 3)')
+            return ', '.join(detail)
 
         def get_webpage(note='Downloading webpage'):
             res = self._download_webpage_handle(
@@ -319,6 +381,7 @@ class TikTokBaseIE(InfoExtractor):
                 return False
 
             webpage, urlh = res
+            last_response[:] = [webpage, urlh]
             self.write_debug(f'Webpage size: {len(webpage)} bytes')
             self.write_debug(f'Impersonation target: {urlh.extensions.get("impersonate")}')
 
@@ -340,9 +403,12 @@ class TikTokBaseIE(InfoExtractor):
             try:
                 cookie_names = self._solve_challenge_and_set_cookies(webpage)
             except ExtractorError as e:
+                # 'Unexpected response from webpage request'（既无 hydration 数据也不是挑战页，多为拦截页）/
+                # 'Unable to extract challenge data' / 'Unable to solve JS challenge'，都附上响应特征
+                message = join_nonempty(e.orig_msg, format_field(response_detail(), None, '(%s)'), delim=' ')
                 if fatal:
-                    raise
-                self.report_warning(e.orig_msg, video_id=video_id)
+                    raise ExtractorError(message, video_id=video_id)
+                self.report_warning(message, video_id=video_id)
                 return video_data, status
 
             webpage = get_webpage(note='Downloading webpage with challenge cookie')
@@ -354,22 +420,30 @@ class TikTokBaseIE(InfoExtractor):
             universal_data = self._get_universal_data(webpage, video_id)
 
         if not universal_data:
-            message = 'Unable to extract universal data for rehydration'
+            message = join_nonempty(
+                'Unable to extract universal data for rehydration', format_field(response_detail(), None, '(%s)'), delim=' ')
             if fatal:
-                raise ExtractorError(message)
+                raise ExtractorError(message, video_id=video_id)
             self.report_warning(message, video_id=video_id)
             return video_data, status
 
         status = traverse_obj(universal_data, ('webapp.video-detail', 'statusCode', {int})) or 0
         video_data = traverse_obj(universal_data, ('webapp.video-detail', 'itemInfo', 'itemStruct', {dict}))
 
-        if not traverse_obj(video_data, ('video', {dict})) and traverse_obj(video_data, ('isContentClassified', {bool})):
+        self._check_content_classified(video_data, video_id, fatal)
+
+        return video_data, status
+
+    def _check_content_classified(self, item_struct, video_id, fatal=True):
+        """
+        敏感内容未登录时服务端返回 statusCode 0 但 itemStruct 没有 video（网页为空 dict、/api/item/detail/ 缺键）且
+        isContentClassified 为真（上游 #12445）；网页与 signed_web_api 两条渠道同样处理。
+        """
+        if not traverse_obj(item_struct, ('video', {dict})) and traverse_obj(item_struct, ('isContentClassified', {bool})):
             message = 'This post may not be comfortable for some audiences. Log in for access'
             if fatal:
                 self.raise_login_required(message)
             self.report_warning(f'{message}. {self._login_hint()}', video_id=video_id)
-
-        return video_data, status
 
     def _get_subtitles(self, aweme_detail, aweme_id, user_name):
         # TODO: Extract text positioning info
@@ -739,7 +813,13 @@ class TikTokBaseIE(InfoExtractor):
 
         play_meta = filter_dict(play_meta)
 
-        for play_url in traverse_obj(video_info, ('playAddr', ((..., 'src'), None), {url_or_none})):
+        play_urls = traverse_obj(video_info, ('playAddr', ((..., 'src'), None), {url_or_none}))
+        if getattr(self, '_tiktok_play_mirror_only', False):
+            # 顶层 playAddr 是直连 CDN 地址，signed_web_api 渠道下不可下载；PlayAddrStruct.UrlList 里有同一文件的 play 镜像
+            play_urls = [
+                play_url for play_url in traverse_obj(play_addr_struct, ('UrlList', ..., {url_or_none}))
+                if urllib.parse.urlparse(play_url).hostname == 'www.tiktok.com'] or play_urls
+        for play_url in play_urls:
             normalized_url = self._proto_relative_url(play_url)
 
             # 如果 play URL 和某个 bitrateInfo URL 一致，则复用 bitrateInfo metadata；
@@ -803,12 +883,25 @@ class TikTokBaseIE(InfoExtractor):
                 'vcodec': 'none',
             })
 
-        # 过滤 TikTok 已知坏格式
+        def is_play_mirror(fmt):
+            return urllib.parse.urlparse(fmt['url']).hostname == 'www.tiktok.com'
+
+        if getattr(self, '_tiktok_play_mirror_only', False):
+            # signed_web_api 渠道（TikTokIE）：接口返回的直连 v16 / v19-webapp-prime 地址下载一律 403（2026-09-23 实测，与 Cookie 无关），
+            # 只有 www.tiktok.com/aweme/v1/play 镜像可下（302 到 CDN，无 Cookie 也 206）。每档只保留镜像；没有镜像的档
+            # （如 download 水印版）去掉；音频不受影响。镜像 2024 年曾出现返回 HTML 页面的情况（上游 issue 11034），
+            # 所以标 __needs_testing，让 yt-dlp 选中前先探一次。
+            kept = []
+            for f in formats:
+                if is_play_mirror(f):
+                    kept.append({**f, '__needs_testing': True})
+                elif f.get('vcodec') == 'none':
+                    kept.append(f)
+            return kept
+
+        # 过滤 TikTok 已知坏格式：www.tiktok.com/aweme/v1/play 镜像曾返回 HTML 页面而非视频
         # 参见 yt-dlp ：https://github.com/yt-dlp/yt-dlp/issues/11034
-        return [
-            f for f in formats
-            if urllib.parse.urlparse(f['url']).hostname != 'www.tiktok.com'
-        ]
+        return [f for f in formats if not is_play_mirror(f)]
 
     def _parse_aweme_video_web(self, aweme_detail, webpage_url, video_id, extract_flat=False):
         author_info = traverse_obj(aweme_detail, (('authorInfo', 'author', None), {
@@ -1145,8 +1238,22 @@ class TikTokIE(TikTokBaseIE):
         'only_matching': True,
     }]
 
+    # --extractor-args "tiktok:strategies=..." 的取值与默认顺序，日志与报错里也用这些名字：
+    # webpage_hydration：视频页 __UNIVERSAL_DATA_FOR_REHYDRATION__ 里的 itemStruct（上游路径：curl_cffi 伪装、随机头、WAF 挑战求解）；
+    # signed_web_api：www.tiktok.com/api/item/detail/，X-Dynosaur / X-Gnarly 纯算签名，无 Cookie、msToken 为空、不依赖 curl_cffi；
+    #   格式只用 www.tiktok.com/aweme/v1/play 镜像地址（直接的 CDN 地址在这条渠道下 403）。
+    # 两条渠道返回同一结构的 itemStruct，档位一致（调研文档 2.7 / 2.13）；一条被封时另一条可能仍可用。
+    # 给了 app_info / device_id 时仍先按上游逻辑尝试 App API（_extract_aweme_app），失败再走这两条。
+    _TIKTOK_STRATEGIES = ('webpage_hydration', 'signed_web_api')
+    # signed_web_api 渠道解析格式时置 True，见 _extract_web_formats
+    _tiktok_play_mirror_only = False
+    # _extract_web_data_and_status 里视频页跳转到 /login 时 raise_login_required 的文案前缀，用来识别并回退
+    _LOGIN_REDIRECT_MESSAGE = 'TikTok is requiring login for access to this content'
+
     def _real_extract(self, url):
         video_id, user_id = self._match_valid_url(url).group('id', 'user_id')
+        # 先解析参数：配置写错时不白发请求
+        strategies = self._parse_strategies_arg(self._TIKTOK_STRATEGIES)
 
         if self._KNOWN_APP_INFO:
             try:
@@ -1156,17 +1263,88 @@ class TikTokIE(TikTokBaseIE):
                 self.report_warning(f'{e}; trying with webpage')
 
         url = self._create_url(user_id, video_id)
-        video_data, status = self._extract_web_data_and_status(url, video_id)
+        # 每级失败都打印具体原因，全部失败时汇总进最终报错；服务端明确说不可用（需登录 / IP 被封 / 视频不存在）时直接抛出
+        failures = []
+        for index, strategy in enumerate(strategies):
+            if strategy == 'webpage_hydration':
+                item_struct, reason = self._fetch_tiktok_webpage_item(url, video_id)
+            else:
+                item_struct, reason = self._fetch_tiktok_api_item(video_id)
+            if item_struct:
+                # signed_web_api 返回的直连 CDN 地址下载 403，只保留 www.tiktok.com/aweme/v1/play 镜像（见 _extract_web_formats）
+                self._tiktok_play_mirror_only = strategy == 'signed_web_api'
+                return self._parse_aweme_video_web(item_struct, url, video_id)
+            failures.append(f'{strategy}: {reason}')
+            if index < len(strategies) - 1:
+                self.report_warning(f'TikTok {strategy} failed: {reason}', video_id)
 
-        if video_data and status == 0:
-            return self._parse_aweme_video_web(video_data, url, video_id)
-        elif status in (10216, 10222):
-            # 10216: private post; 10222: private account
-            self.raise_login_required(
-                'You do not have permission to view this post. Log into an account that has access')
-        elif status == 10204:
-            raise ExtractorError('Your IP address is blocked from accessing this post', expected=True)
-        raise ExtractorError(f'Video not available, status code {status}', video_id=video_id)
+        raise ExtractorError(
+            'Unable to extract TikTok video info. ' + '; '.join(failures), expected=True)
+
+    def _fetch_tiktok_webpage_item(self, url, video_id):
+        """
+        webpage_hydration 渠道：返回 (itemStruct, None) 或 (None, 失败原因)。
+
+        网络错误、挑战求解失败、拦截页、缺 universal data、视频页跳转到登录页都作为可回退的原因（_extract_web_data_and_status
+        会附上状态码 / 大小 / X-TT-System-Error）；statusCode 10216 / 10222、内容分级这类服务端明确要求登录的直接抛出。
+        """
+        try:
+            video_data, status = self._extract_web_data_and_status(url, video_id)
+        except ExtractorError as e:
+            if e.expected and not e.cause and not e.orig_msg.startswith(self._LOGIN_REDIRECT_MESSAGE):
+                # raise_login_required（内容分级需登录）：服务端明确要求登录，不回退。网络错误的 ExtractorError 也是 expected，但带 cause。
+                # 视频页 302 到 /login 多是对可疑 IP 的页面级风控而非内容需登录（内容需登录有 statusCode 10216 / 10222 与
+                # isContentClassified 两个明确信号），此时 /api/item/detail/ 往往仍能返回数据，所以作为可回退的原因
+                raise
+            return None, e.orig_msg
+        reason = self._check_tiktok_status(status, video_id)
+        if reason:
+            return None, reason
+        if not video_data:
+            return None, 'no itemStruct in webpage hydration data'
+        return video_data, None
+
+    def _fetch_tiktok_api_item(self, video_id):
+        """
+        signed_web_api 渠道：GET www.tiktok.com/api/item/detail/?<签名后的 query>，返回 (itemStruct, None) 或 (None, 失败原因)。
+
+        - 签名后的 URL 原样发送（不传 query= 以免重新编码），请求头 UA 与签名用的 UA 一致；默认不做 TLS 伪装（全局 --impersonate 时随之），
+          这样 curl_cffi 的伪装目标被封（上游 #17604）时它仍是独立的一条路；
+        - 不需要任何 Cookie。但响应里直接指向 v16 / v19-webapp-prime 的 CDN 地址下载一律 403（带不带 Cookie 都一样，实测），
+          只有 www.tiktok.com/aweme/v1/play 镜像可下（302 到 CDN，无 Cookie 也 206），所以这条渠道的格式只用镜像地址，
+          见 _extract_web_formats 的 _tiktok_play_mirror_only；
+        - 判据（调研文档 2.13.3）：HTTP 200 空 body + 响应头 tt_orcas_res: 1 = device_id 缺失或 X-Dynosaur 无效（签名常量随 SDK 更新失效）；
+          body statusCode 10000 = 验证信封；其他 statusCode 与网页路径同义；statusCode 0 但 itemStruct 无 video 且 isContentClassified = 需登录。
+        """
+        url = build_item_detail_url(video_id, self._DEVICE_ID)
+        try:
+            body, urlh = self._download_webpage_handle(
+                url, video_id, 'Downloading item detail JSON (signed_web_api)',
+                headers=build_item_detail_headers(), expected_status=lambda _: True)
+        except ExtractorError as e:
+            return None, e.orig_msg
+
+        if urlh.status != 200:
+            return None, f'HTTP {urlh.status}: {response_snippet(body)}'
+
+        if not body.strip():
+            if urlh.headers.get('tt_orcas_res') == '1':
+                return None, 'HTTP 200 with empty body: signature or device rejected (tt_orcas_res=1)'
+            return None, 'HTTP 200 with empty body'
+
+        try:
+            data = json.loads(body)
+        except ValueError:
+            return None, f'non-JSON response: {response_snippet(body)}'
+
+        reason = self._check_tiktok_status(traverse_obj(data, ('statusCode', {int_or_none})), video_id)
+        if reason:
+            return None, reason
+        item_struct = traverse_obj(data, ('itemInfo', 'itemStruct', {dict}))
+        if not item_struct:
+            return None, 'no itemStruct in response'
+        self._check_content_classified(item_struct, video_id)
+        return item_struct, None
 
 
 class TikTokUserIE(TikTokBaseIE):
@@ -1691,19 +1869,8 @@ class DouyinIE(TikTokBaseIE):
     _douyin_original_probe = True
 
     def _douyin_extractor_arg(self, key, default):
-        """
-        读 --extractor-args "douyin:<key>=..."，返回小写字符串列表；没配置时返回 default。
-
-        Python API 里每个值都必须是字符串列表：写成字符串会被 _configuration_arg 拆成单个字符（'true' → t、r、u、e），
-        写成 [True] 会在转小写时抛 AttributeError、写成 True 会在 list() 时抛 TypeError，这里提前报出可读的错误。
-        """
-        value = traverse_obj(self._downloader.params, ('extractor_args', self.ie_key().lower(), key))
-        if value is not None and (
-                not isinstance(value, (list, tuple)) or not all(isinstance(item, str) for item in value)):
-            raise ExtractorError(
-                f'Douyin extractor arg {key} must be a list of strings, e.g. {{"{key}": ["..."]}}; got {value!r}',
-                expected=True)
-        return self._configuration_arg(key, default)
+        # 读 --extractor-args "douyin:<key>=..."，校验与报错文案见 TikTokBaseIE._list_extractor_arg（与 TikTokIE 共用）
+        return self._list_extractor_arg(key, default)
 
     def _douyin_bool_arg(self, key, default):
         # 没配置或空列表按默认；CLI 只写 "douyin:original"（不带 =）时 yt-dlp 给出 ['']
@@ -1720,12 +1887,7 @@ class DouyinIE(TikTokBaseIE):
         # 先解析参数：配置写错时不白发请求（包括短链解析）
         # 默认依次尝试 _DOUYIN_STRATEGIES（含义见其注释），--extractor-args "douyin:strategies=..." 可调整顺序或只用其中几条；
         # 每一级失败都打印具体原因，全部失败时汇总进最终报错
-        strategies = list(dict.fromkeys(filter(None, self._douyin_extractor_arg('strategies', []))))
-        strategies = strategies or list(self._DOUYIN_STRATEGIES)
-        if unknown := [strategy for strategy in strategies if strategy not in self._DOUYIN_STRATEGIES]:
-            raise ExtractorError(
-                f'Unknown Douyin strategies: {", ".join(map(repr, unknown))} '
-                f'(available: {", ".join(self._DOUYIN_STRATEGIES)})', expected=True)
+        strategies = self._parse_strategies_arg(self._DOUYIN_STRATEGIES)
         # 上传原片默认不列出；列出时默认先探测（见 _add_douyin_original_format）
         self._douyin_original = self._douyin_bool_arg('original', False)
         self._douyin_original_probe = self._douyin_bool_arg('original_probe', True)
