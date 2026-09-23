@@ -283,7 +283,24 @@ TikTok 拿不到上传原片（`/aweme/v1/play` 已要求 `file_id` + 签名，`
 `--extractor-args "tiktok:strategies=webpage_hydration,signed_web_api"` 可调整顺序或只用其中一条（重复去重、空值按默认、未知名字在任何请求之前报错）。
 除最后一级外每级失败都打印 `TikTok <策略名> failed: <原因>`，全部失败时报错 `Unable to extract TikTok video info. <策略名>: <原因>; ...`。
 给了 `tiktok:app_info` / `device_id` 时仍先按上游逻辑尝试 App API（`_extract_aweme_app`），失败再走这两条，行为未改。
-两条渠道返回同一结构的 `itemStruct`，都交给 `_parse_aweme_video_web` 解析，格式列表、排序、默认选择完全相同（2026-09-23 对 4 个样本逐档比对 `(format_id, filesize)` 一致）。
+两条渠道返回同一结构的 `itemStruct`，都交给 `_parse_aweme_video_web` 解析，排序、默认选择相同。对比（2026-09-23 实测，细节与证据见调研文档 2.7.1）：
+
+| | `webpage_hydration`（网页） | `signed_web_api`（接口） |
+| --- | --- | --- |
+| 数据来源 | `GET www.tiktok.com/@用户/video/<id>` 页面里的 `__UNIVERSAL_DATA_FOR_REHYDRATION__` | `GET www.tiktok.com/api/item/detail/?itemId=<id>&…` |
+| 反爬手段 | curl_cffi TLS 伪装 + 随机垃圾请求头 + 纯 Python 解 WAF 挑战（上游维护） | X-Dynosaur / X-Gnarly 纯算签名（移植 Evil0ctal），UA 必须与签名一致；默认不做 TLS 伪装 |
+| 前置条件 | 不需要 Cookie；依赖 curl_cffi（缺失时只警告） | 不需要 Cookie、不依赖 curl_cffi；`msToken` 留空，`device_id` 随机 19 位 |
+| 取元数据的请求数 | 1 个；遇到 WAF 挑战页 2 个 | 1 个 |
+| 视频档位 | 相同（4 个样本逐档一致，含只剩 540p 的那个） | 相同 |
+| 下载地址 | 直连 `v16 / v19-webapp-prime`，每档 2 个镜像；下载要带页面下发的会话 Cookie（`tt_chain_token`），yt-dlp 自动带 | 直连地址一律 403，只用 `www.tiktok.com/aweme/v1/play` 镜像（302 到 CDN，不需要 Cookie）；每档 1 个地址 |
+| 下载前额外请求 | 无 | 1 次探测（`__needs_testing`，镜像 302 + 206） |
+| 格式列表 | 各档（`-0/-1` 后缀）+ `play` + 水印版 `download` + `audio` | 各档（无后缀）+ `audio`；无水印版 |
+| 元数据 | 完整 itemStruct | 少 11–15 个键（`challenges`、`textExtra`、评论等）；标题、作者、时长、计数、缩略图一致，标签类字段可能缺 |
+| 被封的方式 | TLS 指纹被封（上游 issue 17604）、挑战解不出、风控拦截页（`X-TT-System-Error: 3`）、可疑 IP 被 302 到登录页 | 签名常量随 SDK 版本失效（200 空 body + `tt_orcas_res: 1`）、验证信封（`statusCode 10000`）、镜像返回 HTML |
+| 失效后怎么修 | 跟上游 | 对照 Evil0ctal 上游更新 `websign.py` 常量，跑 `test/test_tiktok_utils_websign.py` |
+| 单次耗时（本机） | 页面约 1–1.6 秒（含伪装握手） | 接口约 0.8 秒 |
+
+两条渠道同一出口：服务端按 IP 做的降档或封锁会一起中招。冗余针对的是「某条路径的反爬机制被改」，不是「IP 被针对」。
 
 1. **`webpage_hydration`**：上游路径，视频页 `__UNIVERSAL_DATA_FOR_REHYDRATION__` 里的 `webapp.video-detail.itemInfo.itemStruct`
     - curl_cffi TLS 伪装（`impersonate=True`；没装 curl_cffi 时只警告一次并不伪装，上游 #17480 的经验是不伪装多半被拒）、随机垃圾头、

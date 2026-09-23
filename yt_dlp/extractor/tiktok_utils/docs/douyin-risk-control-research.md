@@ -2,7 +2,8 @@
 
 - 调研时间：2026-09-21；2026-09-22 补充 Argus 签名实测、上传原片、短链与分享链接、与 media-parser 的对比，
   同日实现 web API 签名（改为第一级）、原片探测，并调研 TikTok 原片；当晚策略改名为 `signed_web_api` / `embed_origin_api` /
-  `ssr_render_data`，原片改为 `original=true` 时才列出、按分辨率排序并默认探测；2026-09-23 修正 API 路径水印版 `download_addr` 的排序与宽高
+  `ssr_render_data`，原片改为 `original=true` 时才列出、按分辨率排序并默认探测；2026-09-23 修正 API 路径水印版 `download_addr` 的排序与宽高；
+  同日跨项目调研 TikTok 下载方案（2.13）并接入第二渠道 `signed_web_api`（2.7.1）
 - 适用分支：`tiktok`
 - 对应代码：`yt_dlp/extractor/tiktok.py`（`DouyinIE`、`TikTokBaseIE._extract_web_formats`）、`yt_dlp/extractor/tiktok_utils/douyin/*`
 
@@ -298,7 +299,7 @@ https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=<id>&aid=6383&msToken
 
 用户要求：即使各渠道拿到的最高档位相同，也要给 TikTok 增加第二个数据渠道做冗余，一条坏了另一条可能还能用。
 `TikTokIE._real_extract` 改成与 `DouyinIE` 同样的策略循环，`--extractor-args "tiktok:strategies=..."` 控制，默认
-`webpage_hydration,signed_web_api`（配置写法与日志见 README「TikTokIE 的两条渠道」）。
+`webpage_hydration,signed_web_api`。两条渠道的对照表、配置写法与日志见 README「TikTokIE 的两条渠道」，本节记录证据与实现细节。
 
 - **端点**：`GET https://www.tiktok.com/api/item/detail/?<业务参数>&X-Dynosaur=...&msToken=&X-Bogus=1&X-Gnarly=...`，
   响应 `itemInfo.itemStruct` 与页面 hydration 的 `webapp.video-detail.itemInfo.itemStruct` 同结构，直接交给 `_parse_aweme_video_web`。
@@ -317,8 +318,8 @@ https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=<id>&aid=6383&msToken
   而网页渠道自己的 `v19` 地址带其会话 Cookie 是 206（对照）。`www.tiktok.com/aweme/v1/play` 镜像则**无 Cookie 也 206**（302 到 `v16m-default.tiktokcdn-us.com`，
   `adapt_lowest_1080_1` 与 `normal_540_0` 各 1 次，10241 字节 `video/mp4`）。所以 signed_web_api 渠道每档只保留镜像地址，直连地址去掉，
   没有镜像的水印版 `download` 不列出（`_extract_web_formats` 的 `_tiktok_play_mirror_only`）。镜像 2024-09 曾返回 HTML 页面（上游 issue 11034，
-  网页渠道因此过滤它），所以标 `__needs_testing`，yt-dlp 选中前先探一次。最初的实现只做了 `-J` 没做下载验证（3.3 早有「只列格式发现不了下载阶段的 403」），
-  由独立复核发现。
+  网页渠道因此过滤它），所以标 `__needs_testing`，yt-dlp 选中前先探一次。教训：最初的实现只做了 `-J` 没做下载验证，403 由独立复核发现，
+  3.3 早有「只列格式发现不了下载阶段的 403」。
 - **需登录的判定**：`statusCode` 0 但 `itemStruct` 没有 `video` 且 `isContentClassified: true`（如 `ContentClassificationReason 209007`，
   样本 @jacob__knowles/7279901785777573166）= 敏感内容需登录，两条渠道同抛登录提示、不回退（最初只在网页渠道判定，复核发现后抽成共用方法）。
   视频页 302 到 `/login` 则作为可回退原因（多是页面级风控，不是内容需登录）。
@@ -332,9 +333,8 @@ https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=<id>&aid=6383&msToken
   hankgreen1/7047596209028074758、@/7099120109842713899）4/4 成功，`(format_id, filesize, width, height, vcodec, tbr, fps, quality)` 逐档一致，标题 / 作者 / 计数一致；
   `strategies=signed_web_api --test` 实际下载 willsmith / hankgreen1 / 7099120109842713899 3/3 成功（每个视频：接口 1 次 → 探测镜像 302+206 → 下载 302+206，落盘 10241 字节），
   默认路径 `--test` 对照 206（`mp_work10/acc_*.out`）。`DataSize` 页面是字符串、API 是整数，`formats.py` 的 `int_or_none` 兼容，未改共用逻辑。
-  实现者首轮对 tiktok.com 发了 24 次请求（有效 8 次，其余是 shell 循环把 URL 少写 `/video/` 落到 generic extractor），超出单 agent 15 次的上限，
-  记录在 `mp_work9/implement/cli_run_wrong_urls.log`。
-- **未验证**：业务机（电信出口）上「页面降档而 API 不降」是否成立（2.13.2.3 第 3 步）；签名常量的时效（JoeanAmier 2026 上半年整体失效的先例）。
+- **未验证**：业务机（电信出口）上「页面降档而 API 不降」是否成立（2.13.2.3 第 3 步；本机对只剩 540p 的 7099120109842713899 两条渠道一致，接口没有额外档位）；
+  签名常量的时效（JoeanAmier 2026 上半年整体失效的先例）；接口元数据少掉的键对 yt-dlp 输出的影响只核对了标题 / 作者 / 时长 / 计数 / 缩略图。
 
 ### 2.8 App feed（未接入，仅实测）
 
@@ -680,7 +680,8 @@ TikTok 走 App API 的路径（`_extract_aweme_app`，以及 Sound / Effect / Ta
 
 1. **业务机现象分型**：「只有 540p」是 #15690 型（`bitrateInfo` 为空、只剩 `play`）还是 `bitrateInfo` 只到 540 档？需要当时的 info.json / `--write-pages` 页面才能对号入座；两个上游 issue 表现相反（#15690 `--xff US` 有效，#17393 无效）。
 2. **XFF US 在 CN 出口的效果**：本机出口已是美国，实验只证明 US→EU 方向不降档、XFF 头被边缘层读取；CN→US 方向未测。PR #15710 三个副作用在电信 + 代理出口下的发生率也未知，移植前需 ≥20 次统计。
-3. **两条路径是否同时降档**：`/api/item/detail/` 与页面 hydration 在本机 9 次全一致；业务机上若同时降档，第二数据源无用。
+3. **两条路径是否同时降档**：`/api/item/detail/` 与页面 hydration 在本机 9 次全一致，对已降档的 7099120109842713899 也一致（都只剩 `lowest_540_0`）；
+   业务机上若同时降档，第二数据源对画质无用，只剩冗余价值。
 4. **业务机的 curl_cffi 版本与伪装目标**：若走 chrome-150，会先出现「Unexpected response」而非降档（#17604），两者要分开。
 5. **Cookie 效果**：#15690 的说法未经任何人验证；#14172 反例；业务机若测需用测试账号，并检查 hvc1 无声档。
 6. **App 端是否仍下发 `original_*` / `quality_type 10000`**：#7109 2023-06 有，2025-07 报失效；tokcdn 同一视频从原片级退化为转码档说明第三方拿原片也不稳定。没有开源项目做过带完整签名的对比。
