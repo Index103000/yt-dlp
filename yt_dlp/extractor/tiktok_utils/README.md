@@ -237,11 +237,16 @@ Python API 写法（命令行等价写法见末尾）。每个值都必须是「
 yt-dlp --extractor-args "douyin:strategies=signed_web_api,embed_origin_api,ssr_render_data;original=true;original_probe=true" "https://www.douyin.com/video/<id>"
 ```
 
-## TikTok 网页路径的排序
+## TikTok：不改排序，档位缺失是服务端按地区下发
 
 TikTok 拿不到上传原片（`/aweme/v1/play` 已要求 `file_id` + 签名，`ratio` 被忽略），能拿到的最好文件就是 web 的最高档。
-`_parse_aweme_video_web` 设 `'_format_sort_fields': ('quality', 'res', 'size', 'br')`：同分辨率下体积大的档优先，
-不再因为编码排序先选中低码率 HEVC（hankgreen1 的 VMAF 由 92.09 提高到 98.58）。详见调研文档 2.7。
+格式排序走 yt-dlp 默认逻辑，fork 不设 `_format_sort_fields`（2026-09-22 曾加过「同分辨率优先体积大的档」，次日按用户要求撤回：
+排序由用户在配置里用 `-S` 决定，extractor 不改默认选择）。
+
+用户在业务中观察到的「前几天还能下到 1080p，最近只有 540p」是服务端下发的档位变少，与排序无关：
+上游 [#15690](https://github.com/yt-dlp/yt-dlp/issues/15690) 记录了同类现象（非美国 IP 有时只给 `play` 一档或缺 `bytevc1_1080p`，
+`--xff US` 或登录 Cookie 能拿回多档；现象是间歇性的），上游 PR [#15710](https://github.com/yt-dlp/yt-dlp/pull/15710)（未合并）
+尝试默认带 `X-Forwarded-For: US` 失败再去掉。详见调研文档 2.7。
 
 ------
 

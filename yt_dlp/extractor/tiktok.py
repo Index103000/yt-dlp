@@ -821,9 +821,6 @@ class TikTokBaseIE(InfoExtractor):
         return {
             'id': video_id,
             'formats': None if extract_flat else self._extract_web_formats(aweme_detail),
-            # 同分辨率下优先体积 / 码率大的档，而不是按编码优先选 HEVC：web 给出的 HEVC 档码率常只有 H.264 档的 1/3，
-            # 画质明显更差（hankgreen1 576x1024：HEVC 668k 的 VMAF 92.09，H.264 1895k 为 98.58）
-            '_format_sort_fields': ('quality', 'res', 'size', 'br'),
             'subtitles': None if extract_flat else self.extract_subtitles(aweme_detail, video_id, None),
             'http_headers': {'Referer': webpage_url},
             **author_info,
