@@ -8,6 +8,11 @@ yt_dlp/extractor/
     ├── formats.py
     ├── docs/
     │   └── douyin-risk-control-research.md
+    ├── tiktok/
+    │   ├── __init__.py
+    │   ├── websign.py
+    │   ├── api.py
+    │   └── LICENSE.Apache-2.0
     └── douyin/
         ├── __init__.py
         ├── constants.py
@@ -20,6 +25,10 @@ yt_dlp/extractor/
         ├── websign.py
         ├── mp4probe.py
         └── render_data.py
+
+test/
+├── test_tiktok_utils_websign.py          TikTok 签名器的离线向量测试
+└── testdata/tiktok/websign_vectors.json  向量（Evil0ctal tests/unit/test_signing.py 的 TIKTOK_VECTORS + 浏览器抓包）
 ```
 
 各模块职责如下：
@@ -86,6 +95,20 @@ tiktok_utils/douyin/render_data.py
     - make_jingxuan_url
     - extract_render_data_json
     - extract_video_detail
+
+tiktok_utils/tiktok/websign.py
+    TikTok 网页端 X-Dynosaur / X-Gnarly 签名的纯 Python 实现（仅标准库），TikTokIE 的 signed_web_api 渠道用：
+    - sign_web_query                  输入有序 (key, value) 列表与 UA，返回签名后的完整 query，必须原样发送
+    - sign / encode_query / seal / unseal 等原实现的函数原样保留，供离线向量测试与将来对照上游更新
+    移植自 Evil0ctal/Douyin_TikTok_Download_API src/dtk/signing/native/tiktok_sign.py @ e02c0f3f5（Apache-2.0，
+    许可证全文在同目录 LICENSE.Apache-2.0），文件头保留出处与许可证声明并注明改动；算法与常量未改。常量（ENV_CODE / UB_CODE / SDK_VERSION / SCM_VERSION）随 webmssdk 版本变，
+    失效时的表现是 200 空 body + tt_orcas_res: 1
+
+tiktok_utils/tiktok/api.py
+    /api/item/detail/ 的参数与请求头：
+    - build_item_detail_query         有序参数（aid=1988、device_platform=web_pc、region=US、user_is_login=false、itemId 等）
+    - build_item_detail_url           签名后的完整 URL
+    - build_item_detail_headers       UA（必须与签名用的一致）、Referer / Origin www.tiktok.com
 ```
 
 这样后续替换点非常清晰：
@@ -100,6 +123,8 @@ tiktok_utils/douyin/render_data.py
 | API 参数变化                      | `tiktok_utils/douyin/api.py`                          |
 | RENDER_DATA 结构变化              | `tiktok_utils/douyin/render_data.py`                  |
 | UrlKey 格式变化                   | `tiktok_utils/formats.py`                             |
+| TikTok webmssdk 升版本（X-Dynosaur 常量失效） | `tiktok_utils/tiktok/websign.py`（对照 Evil0ctal 上游更新常量与字段表，再跑 `test/test_tiktok_utils_websign.py`） |
+| TikTok `/api/item/detail/` 参数 / 请求头变化 | `tiktok_utils/tiktok/api.py`                          |
 
 ------
 
@@ -248,6 +273,74 @@ TikTok 拿不到上传原片（`/aweme/v1/play` 已要求 `file_id` + 签名，`
 `--xff US` 或登录 Cookie 能拿回多档；现象是间歇性的），上游 PR [#15710](https://github.com/yt-dlp/yt-dlp/pull/15710)（未合并）
 尝试默认带 `X-Forwarded-For: US` 失败再去掉。2026-09-23 对 yt-dlp 上游、gallery-dl、cobalt、Evil0ctal、JoeanAmier、f2、TikTok-Api、App 签名库等
 做了跨项目调研：所有开源项目的数据源与档位上限都与 fork 相同，没有内置降档处理；排查顺序与落地分支见调研文档 2.13。
+同日按用户要求接入了第二条数据渠道 `signed_web_api`（下一节）：即使档位相同，一条渠道被封时另一条可能仍可用。
+
+------
+
+## TikTokIE 的两条渠道
+
+`TikTokIE._real_extract` 默认依次尝试 `webpage_hydration` → `signed_web_api`，
+`--extractor-args "tiktok:strategies=webpage_hydration,signed_web_api"` 可调整顺序或只用其中一条（重复去重、空值按默认、未知名字在任何请求之前报错）。
+除最后一级外每级失败都打印 `TikTok <策略名> failed: <原因>`，全部失败时报错 `Unable to extract TikTok video info. <策略名>: <原因>; ...`。
+给了 `tiktok:app_info` / `device_id` 时仍先按上游逻辑尝试 App API（`_extract_aweme_app`），失败再走这两条，行为未改。
+两条渠道返回同一结构的 `itemStruct`，都交给 `_parse_aweme_video_web` 解析，格式列表、排序、默认选择完全相同（2026-09-23 对 4 个样本逐档比对 `(format_id, filesize)` 一致）。
+
+1. **`webpage_hydration`**：上游路径，视频页 `__UNIVERSAL_DATA_FOR_REHYDRATION__` 里的 `webapp.video-detail.itemInfo.itemStruct`
+    - curl_cffi TLS 伪装（`impersonate=True`；没装 curl_cffi 时只警告一次并不伪装，上游 #17480 的经验是不伪装多半被拒）、随机垃圾头、
+      纯 Python 解 WAF 挑战（`_wafchallengeid`），1–2 个请求；
+    - 失败原因现在带响应特征：`Unexpected response from webpage request (HTTP 200, 612 bytes, blocked by risk control (X-TT-System-Error: 3))`
+      表示被风控拦截页（不是视频不可用），`Unable to solve JS challenge (...)` / `Unable to extract universal data for rehydration (...)` 是挑战或页面结构问题；
+      HTTP 错误原样透传（`Unable to download webpage: HTTP Error 403: Forbidden`）。这些都会回退到下一渠道。
+2. **`signed_web_api`**：`GET www.tiktok.com/api/item/detail/?itemId=<id>&...&X-Dynosaur=...&msToken=&X-Bogus=1&X-Gnarly=...`
+    - 签名由 `tiktok_utils/tiktok/websign.py` 纯算（移植自 Evil0ctal，Apache-2.0），无 Cookie、`msToken` 留空（不伪造）、
+      `device_id` 用 `tiktok:device_id` 或与列表接口相同的随机 19 位数，1 个请求；
+    - 默认不做 TLS 伪装、不依赖 curl_cffi（全局 `--impersonate` 时随之），与网页路径的封锁面（伪装目标被封、挑战页、拦截页）相互独立；
+    - **下载地址只用 `www.tiktok.com/aweme/v1/play` 镜像**：接口返回的直连 `v16 / v19-webapp-prime` 地址在这条渠道下下载一律 403
+      （带网页会话的 Cookie 也一样，实测），镜像 302 到 CDN 后无 Cookie 也能下；每档只保留镜像，没有镜像的水印版 `download` 不列出，
+      音频不受影响。镜像 2024 年曾返回 HTML 页面（上游 issue 11034，网页渠道因此过滤它），所以标 `__needs_testing`，选中前探一次；
+    - 端点只校验 X-Dynosaur，X-Gnarly 的正确性只能靠离线向量测试保证；签名常量随 webmssdk 版本变，失效表现是
+      `HTTP 200 with empty body: signature or device rejected (tt_orcas_res=1)`；`verification required (statusCode 10000)` 是验证信封；
+      两者都会回退到下一渠道；
+    - 响应里 `DataSize` 是整数（页面是字符串），`formats.py` 统一用 `int_or_none`，不需要区分。
+
+**不回退的情况**（服务端明确说不可用，两条渠道同义）：`statusCode` 10216 / 10222 需登录（`raise_login_required`）、10204 IP 被封
+（`Your IP address is blocked from accessing this post`）、其他非 0 值 `Video not available, status code N`，以及 `statusCode` 0 但 `itemStruct`
+没有 `video` 且 `isContentClassified`（敏感内容需登录，两条渠道同样判定）。
+**会回退的情况**：`statusCode` 0 但没有 `itemStruct`（页面 / 接口结构问题）、`statusCode` 10000（验证信封）、视频页 302 到 `/login`
+（多是对可疑 IP 的页面级风控，不是内容需登录，接口往往仍能返回）。
+
+### extractor-args 配置示例（带注释）
+
+Python API 写法（命令行等价写法见末尾）。与 douyin 一样，每个值都必须是「字符串列表」，写成字符串或布尔值会在发出任何请求之前报出可读错误；值不区分大小写。
+
+```python
+'extractor_args': {
+    # 键名是小写 tiktok，只对 TikTokIE（单个视频）生效；用户页 / 合集等其他 TikTok extractor 仍只走它们自己的接口
+    'tiktok': {
+
+        # ── 提取策略，按顺序依次尝试，前一个失败才用下一个 ──────────────────────────────
+        # 可选值（任意组合，顺序即尝试顺序；重复去重，空值按默认）：
+        #   webpage_hydration  视频页 __UNIVERSAL_DATA_FOR_REHYDRATION__（上游路径）。curl_cffi TLS 伪装 + 随机头 + WAF 挑战求解，
+        #                      1–2 个请求；依赖 curl_cffi 做 TLS 伪装（缺失时只警告、不伪装）。被拦截页 / 挑战失败 / HTTP 错误时打印具体原因并回退。
+        #   signed_web_api     www.tiktok.com/api/item/detail/，X-Dynosaur / X-Gnarly 纯算签名，无 Cookie、msToken 为空，
+        #                      1 个请求；不依赖 curl_cffi。签名常量随 TikTok SDK 版本失效时表现为 200 空 body（tt_orcas_res=1），回退。
+        #                      下载地址只用 www.tiktok.com/aweme/v1/play 镜像（直连 CDN 地址在该渠道下 403），选中前多探 1 次；
+        #                      水印版 download 在该渠道不列出。
+        # 两条渠道的格式列表与默认选择相同；默认：['webpage_hydration', 'signed_web_api']。
+        # 只写一个时，它失败就直接报错，不会退到另一条；适合单独验证某条路径。
+        # 每级失败打印 WARNING「TikTok <策略名> failed: <原因>」，全部失败时报错汇总各级原因；
+        # 需登录 / IP 被封 / 视频不存在时直接报错，不再尝试后续策略。
+        # 上游原有的 app_info / device_id / api_hostname 等参数不变；给了 app_info 时仍先试 App API 再走这里的策略。
+        'strategies': ['webpage_hydration', 'signed_web_api'],
+    },
+},
+```
+
+命令行等价写法：
+
+```bash
+yt-dlp --extractor-args "tiktok:strategies=webpage_hydration,signed_web_api" "https://www.tiktok.com/@<user>/video/<id>"
+```
 
 ------
 
