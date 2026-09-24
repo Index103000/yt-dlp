@@ -638,6 +638,19 @@ TikTok 走 App API 的路径（`_extract_aweme_app`，以及 Sound / Effect / Ta
 - **托管签名服务**（molkex、Loukious 的 RapidAPI）：算法不公开、付费，把请求交给第三方。
 - **黑盒 HD 服务**（tokcdn / tikdownloader、tikwm originalDownloader、snapcdn.app、musicaldown）：来源不可查证；tokcdn 同一视频内容随时间变化（willsmith 今天是 4K QuickTime 上传原片，alex 今天是 32 MB 转码档，6 月的 93.7 MB 版本已不可得，复核 verify_tokcdn）；
   `whois tokcdn.com` 2025-05-28 注册、信息隐藏。不集成。
+- **2026-09-24 实证：TikTok 保存着上传原片，但只有第三方拿得到**（用户用自己账号上传的视频 @lastorderno20001/7688926651073203477 测试）：
+  - 用户在 tikwm 的 originalDownloader 页面下载到的文件，来源地址是 `v16.tokcdn.com/<签名>/<过期>/7688926651073203477_original.mp4`
+    （macOS 下载属性 `kMDItemWhereFroms`），与用户上传的源文件（YouTube `MPNbzS8el70` 的 313 + 251 合并后的 WebM：VP9 3840x2160 + Opus，
+    178.2 秒，20780257 字节，`Lavf62.12.102`）**sha256 完全相同**。即 tokcdn 给的是上传原片本身，不是重新编码或更高转码档。
+  - 同一视频 TikTok 自己只下发两个 540p 档：网页与 `signed_web_api` 都是 `normal_540_0`（173 kbps，3863324 字节）与 `lowest_540_0`（101 kbps），
+    当天上传；tikwm 公开 API（`/api/?hd=1`）的 `hd_size` 也是 3863324，原片只在它单独的 originalDownloader 功能里，该页面有 Cloudflare 托管挑战。
+  - TikTok 自己的路径拼不出原片：`www.tiktok.com/aweme/v1/play` 镜像的 `signaturev3` 解码为 `video_id;file_id;item_id.<哈希>`，签名覆盖这三个参数；
+    把 `file_id` 换成 `video_id`（上传 uri）或去掉都返回 `403 {"status_code":4,"status_msg":"Server is currently unavailable"}`，加 `ratio=default` 被忽略（仍是 540p）。
+  - tikwm 公开 API 返回的地址是 `v16m.tiktokcdn-us.com/<签名>/<过期>/video/tos/alisg/...`（App 接口的地址形态，网页给的是 useast 的 webapp-prime），
+    tokcdn 的路径也仿照这个形态。推测 tokcdn 用带完整签名的 App 接口取原片档（上游 issue 7109 的 App 阶梯里曾有 `original_*` 档，`file_id == video_id`），
+    未证实；开源侧没有可用的 App 签名实现（2.13.4 App 签名库群）。
+  - 修正上面「tokcdn 时而像原片」的判断：至少这个样本是原片本身；alex_selekos 那次拿到转码档，可能是原片未保留或未下发，原因未知。
+  - 结论不变：tokcdn / tikwm originalDownloader 来源不可查、页面有 Cloudflare 挑战（自动化流程过不去，也不应绕过），不集成。
 - **tikwm `hd=1`**：`play` / `hdplay` / `wmplay` 与 web `normal_540_0` / `adapt_lowest_1080_1` / `download` 字节级一致（size 3895234 / hd_size 3435167 / wm_size 3970507），只是 CDN 域换成 tiktokcdn-us.com；没有更高档（reports 实测，与文档 2.7 一致）。
 - **「tokcdn 7 Mbps 文件来自 App bit_rate 阶梯的高档而非上传原片」**（tiktok-hd-research todo.md 推测）：**不成立**。来源自己标 BLOCKED；yt-dlp#7109（2023-06）的 App feed 原文显示阶梯可含 `original_1080_0`（`quality_type: 10000`、`file_id == video_id`、8.3 Mbps）即原片本身作为阶梯一项，「阶梯高档 vs 原片」不是二选一；
   实测 willsmith 的 tokcdn 文件是 2160x3840 QuickTime、`TEEditor` 导出标签、moov 在尾、25 Mbps，分辨率超出任何转码档；已知所有 web 阶梯 1080 档码率 0.67–2.6 Mbps（4 份 GitHub 样本 + 本机 9 份 dump），7 Mbps 与抖音 `ratio=default` 原片实测（6.2–7.0 Mbps）一致。
