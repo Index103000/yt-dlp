@@ -328,36 +328,80 @@ TikTok 拿不到上传原片（`/aweme/v1/play` 已要求 `file_id` + 签名，`
 
 ### extractor-args 配置示例（带注释）
 
-Python API 写法（命令行等价写法见末尾）。与 douyin 一样，每个值都必须是「字符串列表」，写成字符串或布尔值会在发出任何请求之前报出可读错误；值不区分大小写。
+Python API 写法（命令行等价写法见末尾）。与 douyin 一样，每个值都必须是「字符串列表」，写成字符串会被拆成单个字符、写成布尔值会报错，
+两种都在发出任何请求之前报出可读错误；值不区分大小写。只有 `strategies` 是本 fork 新增，其余是上游原有参数。
 
 ```python
 'extractor_args': {
-    # 键名是小写 tiktok，只对 TikTokIE（单个视频）生效；用户页 / 合集等其他 TikTok extractor 仍只走它们自己的接口
+    # 键名是小写 tiktok，只对 TikTokIE（单个视频）生效；用户页 / 合集 / 音乐等其他 TikTok extractor 仍只走它们自己的接口
+    # （它们只读这里的 device_id / app_info 等上游参数，不读 strategies）
     'tiktok': {
 
-        # ── 提取策略，按顺序依次尝试，前一个失败才用下一个 ──────────────────────────────
+        # ── 提取策略（本 fork 新增），按顺序依次尝试，前一个失败才用下一个 ──────────────────
         # 可选值（任意组合，顺序即尝试顺序；重复去重，空值按默认）：
-        #   webpage_hydration  视频页 __UNIVERSAL_DATA_FOR_REHYDRATION__（上游路径）。curl_cffi TLS 伪装 + 随机头 + WAF 挑战求解，
-        #                      1–2 个请求；依赖 curl_cffi 做 TLS 伪装（缺失时只警告、不伪装）。被拦截页 / 挑战失败 / HTTP 错误时打印具体原因并回退。
-        #   signed_web_api     www.tiktok.com/api/item/detail/，X-Dynosaur / X-Gnarly 纯算签名，无 Cookie、msToken 为空，
-        #                      1 个请求；不依赖 curl_cffi。签名常量随 TikTok SDK 版本失效时表现为 200 空 body（tt_orcas_res=1），回退。
-        #                      下载地址只用 www.tiktok.com/aweme/v1/play 镜像（直连 CDN 地址在该渠道下 403），选中前多探 1 次；
-        #                      水印版 download 在该渠道不列出。
-        # 两条渠道的格式列表与默认选择相同；默认：['webpage_hydration', 'signed_web_api']。
+        #   webpage_hydration  视频页 __UNIVERSAL_DATA_FOR_REHYDRATION__（上游路径）：curl_cffi TLS 伪装 + 随机垃圾头 + 纯 Python 解 WAF 挑战，
+        #                      1 个请求（遇到挑战页 2 个）；没装 curl_cffi 时只警告一次、不伪装（多半会被拒）。
+        #                      下载地址是直连 CDN，要带页面下发的会话 Cookie（tt_chain_token），yt-dlp 自动处理。
+        #   signed_web_api     www.tiktok.com/api/item/detail/，X-Dynosaur / X-Gnarly 纯算签名（移植 Evil0ctal，Apache-2.0）：
+        #                      不需要 Cookie、不依赖 curl_cffi，msToken 留空，device_id 随机；1 个请求。
+        #                      下载地址只用 www.tiktok.com/aweme/v1/play 镜像（接口返回的直连 CDN 地址在该渠道下一律 403，与 Cookie 无关），
+        #                      选中前多探 1 次；水印版 download 在该渠道不列出。签名常量随 TikTok 前端 SDK 版本失效，表现为
+        #                      「200 空 body（tt_orcas_res=1）」并自动回退，届时对照 Evil0ctal 上游更新 tiktok_utils/tiktok/websign.py。
+        # 两条渠道的画质档位完全相同（4 个样本逐档一致），接口渠道不会给出更高档；它的价值是封锁面不同：
+        # 一条靠 TLS 指纹与挑战，一条靠签名算法，同时失效的概率比单一路径低。同一台机器同一出口，按 IP 的降档 / 封锁两条会一起中招。
+        # 默认：['webpage_hydration', 'signed_web_api']（网页优先：上游维护、元数据更全、下载不多一次探测）。
         # 只写一个时，它失败就直接报错，不会退到另一条；适合单独验证某条路径。
-        # 每级失败打印 WARNING「TikTok <策略名> failed: <原因>」，全部失败时报错汇总各级原因；
-        # 需登录 / IP 被封 / 视频不存在时直接报错，不再尝试后续策略。
-        # 上游原有的 app_info / device_id / api_hostname 等参数不变；给了 app_info 时仍先试 App API 再走这里的策略。
+        # 每级失败打印 WARNING「TikTok <策略名> failed: <原因>」，全部失败时报错「Unable to extract TikTok video info. <策略名>: <原因>; ...」。
+        # 不回退、直接报错的情况（两条渠道同义）：statusCode 10216 / 10222 需登录、10204 IP 被封、其他非 0 状态码视频不可用、
+        #   敏感内容需登录（statusCode 0 但没有 video 且 isContentClassified）。
+        # 会回退的情况：网页被风控拦截页（原因里带 X-TT-System-Error: 3）、WAF 挑战解不出、HTTP 错误、页面 302 到登录页、
+        #   接口签名被拒（tt_orcas_res=1）、验证信封（statusCode 10000）、响应里没有 itemStruct。
         'strategies': ['webpage_hydration', 'signed_web_api'],
+
+        # ── 上游原有：App API（移动端接口）参数，默认都不用配 ─────────────────────────────────
+        # 给了 device_id 或 app_info，才会在上面两条策略之前先尝试 App API（_extract_aweme_app：
+        # POST api16-normal-c-useast1a.tiktokv.com/aweme/v1/multi/aweme/detail/，X-Argus 留空）。
+        # 目前它不可用：无签名请求返回 200 空 body（tt_orcas_res: 1），失败后自动走上面两条策略，只是每个视频多 1 个请求（调研文档 2.7、2.13.4）。
+        # 不配时 device_id 每次运行随机生成一个 19 位数，只用于 signed_web_api 与列表接口的 query。
+        # 'device_id': ['7250000000000000001'],          # 真实设备的 19 位 device_id
+        # 'app_info': ['1234567890123456789'],           # 一个或多个 "<iid>/[app_name]/[app_version]/[manifest_app_version]/[aid]"，
+        #                                                # iid（App 安装 ID）必填，其余可省，如 '123,456/trill///1180'
+        # 'api_hostname': ['api22-normal-c-alisg.tiktokv.com'],  # App API 主机，默认 api16-normal-c-useast1a.tiktokv.com
+        # 'app_name': ['trill'],                         # 默认 musical_ly（韩国 / 菲律宾 / 台湾 / 泰国 / 越南版为 trill）
+        # 'app_version': ['34.1.2'],                     # 与 manifest_app_version 成对配，默认 35.1.3 / 2023501030
+        # 'manifest_app_version': ['2023401020'],
+        # 'aid': ['1180'],                               # App ID：musical_ly 1233、trill 1180、universal 0（默认 0）
     },
 },
 ```
 
-命令行等价写法：
+与之相关的几个 yt-dlp 通用选项：
+
+```python
+# 地区伪装：给每个请求加 X-Forwarded-For: <该国随机 IP>。上游 issue 15690 里英国 / 日本出口的用户加 --xff US 后拿回了完整档位，
+# 但本机实测（美国出口）对档位无影响，且上游 PR 15710 记录它可能引发 503 / 验证码页。业务机遇到只给低档时先做 A/B 再决定是否常开。
+# 'geo_bypass_country': 'US',          # 等同 --xff US
+
+# TLS 伪装目标只影响 webpage_hydration。curl_cffi 0.16.2 起的 chrome-150 目标 2026-09 被 TikTok 整体封（上游 issue 17604），
+# 出现「Unexpected response from webpage request」时先看 -v 里的 [debug] Impersonation target: 是什么。
+# 'impersonate': 'chrome-146:macos',   # 等同 --impersonate
+
+# 登录 Cookie 只在「需登录」的错误时有用（私密 / 敏感内容），对画质档位没有已证实的作用（调研文档 2.13.2.1）；
+# 带 Cookie 时部分 1080 档会换成无音轨的 hvc1 变体，fork 已按上游处理（标 acodec none 并测试）。
+# 'cookiesfrombrowser': ('chrome',),
+
+# 格式选择器：TikTok 网页渠道的水印版叫 download、抖音 API 路径叫 download_addr-N，用 !^= 一并排除；接口渠道本来就没有水印版
+'format': 'bestvideo+bestaudio/best[vcodec!=none][format_id!^=download]',
+```
+
+命令行等价写法，多个键之间用 `;` 分隔：
 
 ```bash
 yt-dlp --extractor-args "tiktok:strategies=webpage_hydration,signed_web_api" "https://www.tiktok.com/@<user>/video/<id>"
 ```
+
+`-v` 日志里判断走了哪条渠道：网页渠道有 `Downloading webpage` 与 `[debug] Impersonation target:`；接口渠道有
+`Downloading item detail JSON (signed_web_api)`，下载前有 `[info] Testing format <档位>`。
 
 ------
 
