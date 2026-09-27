@@ -3,7 +3,8 @@
 - 调研时间：2026-09-21；2026-09-22 补充 Argus 签名实测、上传原片、短链与分享链接、与 media-parser 的对比，
   同日实现 web API 签名（改为第一级）、原片探测，并调研 TikTok 原片；当晚策略改名为 `signed_web_api` / `embed_origin_api` /
   `ssr_render_data`，原片改为 `original=true` 时才列出、按分辨率排序并默认探测；2026-09-23 修正 API 路径水印版 `download_addr` 的排序与宽高；
-  同日跨项目调研 TikTok 下载方案（2.13）并接入第二渠道 `signed_web_api`（2.7.1）
+  同日跨项目调研 TikTok 下载方案（2.13）并接入第二渠道 `signed_web_api`（2.7.1）；2026-09-24 证实 TikTok 保存着上传原片、只有第三方拿得到（2.13.4）；
+  2026-09-27 验证开源 App 签名不可行（2.13.8），并改写历史去掉提交说明里指向上游的编号（3.3）
 - 适用分支：`tiktok`
 - 对应代码：`yt_dlp/extractor/tiktok.py`（`DouyinIE`、`TikTokBaseIE._extract_web_formats`）、`yt_dlp/extractor/tiktok_utils/douyin/*`
 
@@ -697,7 +698,8 @@ TikTok 走 App API 的路径（`_extract_aweme_app`，以及 Sound / Effect / Ta
    业务机上若同时降档，第二数据源对画质无用，只剩冗余价值。
 4. **业务机的 curl_cffi 版本与伪装目标**：若走 chrome-150，会先出现「Unexpected response」而非降档（#17604），两者要分开。
 5. **Cookie 效果**：#15690 的说法未经任何人验证；#14172 反例；业务机若测需用测试账号，并检查 hvc1 无声档。
-6. **App 端是否仍下发 `original_*` / `quality_type 10000`**：#7109 2023-06 有，2025-07 报失效；tokcdn 同一视频从原片级退化为转码档说明第三方拿原片也不稳定。没有开源项目做过带完整签名的对比。
+6. **App 端是否仍下发 `original_*` / `quality_type 10000`**：#7109 2023-06 有，2025-07 报失效。2026-09-24 证实 TikTok 保存着上传原片、tokcdn 能拿到（2.13.4），
+   但 2026-09-27 用开源 App 签名拿不到 App 接口的任何 JSON（2.13.8），所以 App 阶梯里有没有原片档仍未知。
 7. **Evil0ctal 的三条实测互相矛盾之处**：「伪造 msToken → 0 字节」本机未复现；「无 Cookie 可用」是本次实测而非项目承诺（JoeanAmier 默认 device_id 空且要求 cookie_tiktok）；服务端策略可随时变。
 8. **JoeanAmier 5.8 在空 `device_id` 下是否真能工作**：本机复现用的是随机 19 位；Evil0ctal 称缺 device_id 即 200 空。
 9. **region / priority_region / tz_name 参数对档位是否有影响、与 XFF 是否叠加**：未测。
@@ -706,6 +708,24 @@ TikTok 走 App API 的路径（`_extract_aweme_app`，以及 Sound / Effect / Ta
 12. **直播 720p（streamlink#6911）与点播降档是否同一套策略**：无证据。
 13. **Reddit 用户报告**：未覆盖。
 
+
+#### 2.13.8 App 签名可行性验证（2026-09-27，结论：不可行，已停止）
+
+目的：2.13.4 证实 TikTok 保存着上传原片、第三方 tokcdn 拿得到，推测来源是带完整签名的 App 接口。本节验证开源 App 签名能否拿到 App 接口的 `bit_rate` 阶梯、其中有没有原片档。
+方法：只选可审查的纯源码实现（排除二进制、混淆、需 APK / unidbg、付费托管，排除清单 20 余个仓库），逐行读完后把签名函数移植到临时目录运行，不进仓库；
+判据是某地址总大小 20780257 且前 4096 字节 sha256 与用户上传原片一致（7688926651073203477）。每个候选 ≤ 25 个请求，不用 Cookie / 账号。
+
+| 候选 | 走到哪一步 | 结果 |
+| --- | --- | --- |
+| iqbalmh18/tiktok-signer @ c981a8b095（2026-08-08） | 源码审查 + 离线移植后中止 | 编写联网驱动时该 agent 的输出被安全分类器拦截，未发任何 TikTok 请求，未重试。审查发现 `ladon._ror` 写成逻辑或（`shifted or low`）；作者 issue 3 的示例在注册失败时静默改用写死的他人 device_id，其「search 可用」自证证据力不足；issue 4「All request are empty response」无回复 |
+| code-root/tiktok-android-signing-toolkit @ f43b93ec0f（2026-03-24） | device_register 失败 | 两种报文都返回 `device_id: 0`；离线复算作者抓包的 X-Gorgon 与真机值不同（作者测试注释也承认无法复现 8404 版）；借用 armxe 注册的设备请求 7 次全部 `403 + Tt_block: 2022` |
+| armxe/tiktok-api 的 Mobile/（Metasec）@ d335999b73 | device_register 成功，接口被拒 | 注册拿到 device_id（TTEncrypt 有效；不签名注册同样发号，说明注册不校验签名）；该设备请求 `aweme/detail`、`multi/aweme/detail`、`feed` 一律 `403` 空 body + `tt_block: 2022`（去掉签名、换 alisg 主机、去掉 iid 都一样）；随机设备则是 `200` 空 body + `tt_orcas_res: 1`，签与不签结果完全相同 |
+
+- 共 30 个 TikTok 请求（两个联网候选各 15），无验证码页；注册过 2 个匿名设备（非账号）。
+- **签名在所有成对对照里都没有改变服务端的响应**：开源签名不被接受，或被接受前还缺设备激活（armxe README 称新设备要先「warm-up」，激活流程只在其付费部分）或受数据中心出口（AS906 DMIT）影响，均未验证。
+- 没有拿到任何 App JSON，因此「App 阶梯里是否有原片档」仍未知；Range 探测 0 次。
+- 结论：开源 App 签名不能作为 fork 的第三条渠道。继续需要逆向当前 App 的签名与设备激活流程，维护代价高（签名常量随 App 版本数周一换），且涉及绕过 TikTok 私有接口的反自动化防护，不再投入。
+  原片需求目前只有第三方 tokcdn 能满足（2.13.4），同样不集成。
 
 #### 2.13.7 本次实测环境与请求记录
 
@@ -829,9 +849,12 @@ for i in range(5):
 - **Mac 上「直连」TikTok 其实是美国出口**：本机 Clash Verge 的 fake-ip 透明代理接管了 `*.tiktok.com`（`dig +short www.tiktok.com` → `198.18.x.x`，
   进程 `verge-mihomo`），出口为 Los Angeles / AS906 DMIT，TikTok 页面 `app-context.region=US`；`--proxy ""` 只关掉 yt-dlp 自己的代理，绕不过它。
   `www.douyin.com` 不在规则内，仍是江苏移动直连。所以本机对 TikTok 的所有实测都是「美国出口」，要测中国出口只能在业务机上做（2.13.2.3）。
-- **commit message 里不要写 `#12345`**：本仓库是 yt-dlp/yt-dlp 的 GitHub fork，fork 没有自己的 issue，`#N`（以及 `yt-dlp/yt-dlp#N`、完整 URL）都会被
-  GitHub 解析成上游的 issue / PR，并在上游页面时间线留下「referenced」反链（2026-09-22/23 的两个提交已经出现在上游 PR 15710 的时间线上，对维护者可见）。
-  写成「上游 issue 15690」「PR 15710」这类不带 `#` 的形式，完整链接只放在文档里。
+- **commit message 里不要写 `#12345`**：本仓库是 yt-dlp/yt-dlp 的 GitHub fork，fork 没有自己的 issue，提交说明里的 `#N`（以及 `yt-dlp/yt-dlp#N`、`GH-N`、
+  上游 issue / PR 的完整 URL）都会被 GitHub 解析成上游的 issue / PR，推送后在上游页面时间线留下「Index103000 added a commit that referenced this issue」，
+  所有访客可见并能点进本仓库。**同步上游改动时最容易犯**：照抄上游提交标题里的 `(#17452)`。一律写成 `(PR 17452)`、「上游 issue 4138」这类不带 `#` 的形式，
+  完整链接只放在文档文件里（文件内容不会触发引用）。
+  2026-09-27 已把 tiktok / tiktok_ali_540p 两个分支上 4 个含 `#N` 的提交说明改写并强推（文件树逐提交比对不变），但上游已有的 21 条引用不会随之消失：
+  GitHub 的 fork 网络里旧提交按哈希仍能打开，要彻底移除只能找 GitHub Support。改写前的分支头在本地 `refs/backup/*-pre-rewrite-20260927`（未推送）。
 - 用 `--test` 实际下载（只下 10KB），只列格式发现不了下载阶段的 403。
 - 代理每个请求 4–6 秒，SSR 方案一个场景要几十秒，批量用例放后台跑，Python 加 `-u` 避免超时丢输出。
 - 签名类算法重构时，用固定输入生成基准输出做逐字回归（`__ac_signature` 用了 204 组）。
@@ -900,8 +923,8 @@ TikTok 方向 2026-09-23 跨项目调研新增的参考项目（yt-dlp 上游各
    - 旋转：`mp4probe` 按 `tkhd` 矩阵换算显示宽高，ffmpeg 合成的 90° 样本结果正确，但抖音原片样本里没有带旋转矩阵的，真实文件未验证；
    - 海外出口的原片被调度到 `v5-dy-ov-experiment.zjcdn.com`，曾出现一次 TLS 建连失败（换出口后成功），偶发性未量化。
 4. **TikTok**：第二渠道 `signed_web_api` 已接入（2.7.1），但它对「1080p→540p」是否有效未验；业务机「1080p→540p」的分型与缓解（XFF US、`/api/item/detail/` 第二路径、换出口）只能在业务机上按 2.13.2.3 排查，本机出口是美国测不了；
-   完整的未解决清单见 2.13.6。登录 Cookie「稳定 1080p」的说法复核不成立（2.13.2.1），只保留为实验项；签名 App API 在开源侧没有可用实现（2.13.4），
-   若将来恢复，先看是否仍下发 `original_*` / `quality_type 10000`（上游 issue 7109）。
+   完整的未解决清单见 2.13.6。登录 Cookie「稳定 1080p」的说法复核不成立（2.13.2.1），只保留为实验项；签名 App API 在开源侧没有可用实现，
+   2026-09-27 实测开源签名不被接受、已停止投入（2.13.4、2.13.8）；上传原片目前只有第三方 tokcdn 拿得到，不集成。
 5. **其他 `filter_reason`**：遇到已删除、私密、地区限制的视频时，补充对应的取值和页面表现；
    7422307345595731236 在巴西代理下返回空 `filter_reason`，未用国内直连复测（2.5）。
 6. **fork 尚不支持的内容**：图集（`/note/`、`/slides/`）、LivePhoto、音乐、合集、放映厅 / 短剧。
