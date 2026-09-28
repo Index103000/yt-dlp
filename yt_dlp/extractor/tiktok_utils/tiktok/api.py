@@ -17,7 +17,8 @@ TIKTOK_WEB_HOST = 'https://www.tiktok.com/'
 ITEM_DETAIL_API_URL = 'https://www.tiktok.com/api/item/detail/'
 
 # X-Dynosaur 含 UA 哈希，签名与请求头必须用同一个 UA。browser_platform / browser_version / os 参数与它对应（Mac + Chrome）；
-# Chrome 146 与网页路径 curl_cffi 当前的伪装目标（chrome-146:macos）同代
+# Chrome 146 是接入时（2026-09-23）网页路径 curl_cffi 伪装目标的版本；网页路径现在用 chrome-150，本渠道默认不做 TLS 伪装，不受影响。
+# 全局 --impersonate 时 TLS 随之伪装，而这里显式设的 UA 会保留（只替换 std_headers 里的默认值），TLS 与 UA 版本可能不一致；UA 与签名绑定，别单独改
 TIKTOK_WEB_USER_AGENT = (
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
     'AppleWebKit/537.36 (KHTML, like Gecko) '

@@ -729,6 +729,7 @@ class TikTokBaseIE(InfoExtractor):
 
             format_info = build_tiktok_bitrate_meta(bitrate_info, ratio=ratio, parse_json_func=self._parse_json)
 
+            # bytevc2 is bytedance's own custom h266/vvc codec, as-of-yet unplayable
             is_bytevc2 = format_info.get('vcodec') == 'bytevc2'
 
             if is_bytevc2:
@@ -904,8 +905,7 @@ class TikTokBaseIE(InfoExtractor):
                     kept.append(f)
             return kept
 
-        # 过滤 TikTok 已知坏格式：www.tiktok.com/aweme/v1/play 镜像曾返回 HTML 页面而非视频
-        # 参见 yt-dlp ：https://github.com/yt-dlp/yt-dlp/issues/11034
+        # Filter out broken formats, see https://github.com/yt-dlp/yt-dlp/issues/11034
         return [f for f in formats if not is_play_mirror(f)]
 
     def _parse_aweme_video_web(self, aweme_detail, webpage_url, video_id, extract_flat=False):

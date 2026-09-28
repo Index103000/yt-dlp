@@ -5,7 +5,8 @@
   `ssr_render_data`，原片改为 `original=true` 时才列出、按分辨率排序并默认探测；2026-09-23 修正 API 路径水印版 `download_addr` 的排序与宽高；
   同日跨项目调研 TikTok 下载方案（2.13）并接入第二渠道 `signed_web_api`（2.7.1）；2026-09-24 证实 TikTok 保存着上传原片、只有第三方拿得到（2.13.4）；
   2026-09-27 验证开源 App 签名不可行（2.13.8），并改写历史去掉提交说明里指向上游的编号（3.3）；
-  2026-09-28 原片探测改为按容器补齐信息：支持 WebM / MKV，其他容器或解析失败时用 ffprobe 兜底（2.9）
+  2026-09-28 原片探测改为按容器补齐信息：支持 WebM / MKV，其他容器或解析失败时用 ffprobe 兜底（2.9）；
+  同日 chrome-150 伪装目标实测已解封，恢复与上游一致，并查清全局 `--impersonate` 改不了网页渠道的目标（2.7）
 - 适用分支：`tiktok`
 - 对应代码：`yt_dlp/extractor/tiktok.py`（`DouyinIE`、`TikTokIE` 的两条渠道、`TikTokBaseIE._extract_web_formats`）、
   `yt_dlp/extractor/tiktok_utils/douyin/*`（抖音签名、Cookie、原片探测）、`yt_dlp/extractor/tiktok_utils/tiktok/*`（TikTok 签名接口）；
@@ -272,6 +273,15 @@ https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=<id>&aid=6383&msToken
   带水印的 download 实测 665803 字节而 `video.size` 为 658136，所以 download 的兜底大小写 `filesize_approx`。
 - `TikTokIE._TESTS` 中多数视频锁区（`Your IP address is blocked from accessing this post`，换巴西 IP 也一样）；
   当时可访问的样本：`pokemonlife22/7059698374567611694`、`hankgreen1/7047596209028074758`，`tatemcrae/7107337212743830830` 仅国内直连（经本机代理）可访问。
+- **TLS 伪装目标**（2026-09-28）：网页渠道（`webpage_hydration`、用户页、直播页）请求时传 `impersonate=True` 即「任意目标」，
+  yt-dlp 取 curl_cffi 支持的最新一个（0.16.1 起为 chrome-150）。请求级设置优先于全局 `--impersonate`（`networking/impersonate.py` 的
+  `_get_request_target`），所以 `--impersonate chrome-146:macos` 改不了网页渠道的目标（实测 `-v` 仍打印 `chrome-150:macos-26`），
+  只会让不带伪装的 `signed_web_api` 也随之伪装。chrome-150 在 2026-09 初被 TikTok 整体封过（上游 issue 17604），fork 当时在
+  `networking/_curlcffi.py` 注释掉了它；2026-09-28 用户实测已解封，本机（美国出口）只走 `webpage_hydration` 复测 3 个样本：
+  可访问的 2 个在 chrome-150 下正常（540p，格式与此前一致），另 1 个锁区报 `Your IP address is blocked`，换 chrome-146 也一样。
+  fork 已恢复与上游一致。再被封时的表现见 3.1 日志表「Unexpected response from webpage request」一行（会自动回退 `signed_web_api`）；
+  配置层没有开关能换网页渠道的目标，要绕开只能改代码：上游有 `_DEPRIORITIZED_TARGETS`（`_curlcffi.py`，为同类问题设的降优先级表），
+  把 chrome-150 加进去比注释掉更干净。
 
 **TikTok 拿不到原片**（2026-09-22 调研，4 个可访问视频 + 1 个锁区视频，美国与巴西出口）：
 
@@ -603,7 +613,7 @@ TikTok 走 App API 的路径（`_extract_aweme_app`，以及 Sound / Effect / Ta
    - `bitrateInfo` 是否为空只剩 `play`（#15690 型，quality 随机）还是 `bitrateInfo` 只下发到 540 档（另一型）；两型缓解方式不同；
    - 各档 `UrlKey` / `GearName` 与 `PlayAddr.Width/Height`，别只看 -F 的 RESOLUTION 列（#16532 的 540→576 硬映射）；
    - 响应头有无 `X-TT-System-Error: 3`（拦截页）、`tt_orcas_res`（签名 / 设备拒绝）；
-   - `[debug] [TikTok] Impersonation target:` 与 `curl_cffi` 版本（#17604 chrome-150 被封）；
+   - `[debug] [TikTok] Impersonation target:` 与 `curl_cffi` 版本（#17604 chrome-150 曾被封，2026-09-28 已解封，见 2.7）；
    - 页面 `biz-context.geoCity` / `vgeo` / `idc` / `app-context.region`，确认 TikTok 看到的出口地区（fake-ip 类透明代理会让「直连」名不副实，见本节开头）。
 2. **同一分钟内** 跑 直连 / `--xff US` / `--xff GB` 各 1 次，比较档位集合；至少重复 3 轮看间歇性。
    预期三种结果：(a) XFF US 稳定恢复 1080 → 走 2.13.2.4 的 XFF 开关；(b) 无差异 → XFF 不是解法；(c) 503 / 10101 / 验证码 → XFF 有副作用，记录频率。
@@ -716,7 +726,7 @@ TikTok 走 App API 的路径（`_extract_aweme_app`，以及 Sound / Effect / Ta
 2. **XFF US 在 CN 出口的效果**：本机出口已是美国，实验只证明 US→EU 方向不降档、XFF 头被边缘层读取；CN→US 方向未测。PR #15710 三个副作用在电信 + 代理出口下的发生率也未知，移植前需 ≥20 次统计。
 3. **两条路径是否同时降档**：`/api/item/detail/` 与页面 hydration 在本机 9 次全一致，对已降档的 7099120109842713899 也一致（都只剩 `lowest_540_0`）；
    业务机上若同时降档，第二数据源对画质无用，只剩冗余价值。
-4. **业务机的 curl_cffi 版本与伪装目标**：若走 chrome-150，会先出现「Unexpected response」而非降档（#17604），两者要分开。
+4. **业务机的 curl_cffi 版本与伪装目标**：chrome-150 被封时会先出现「Unexpected response」而非降档（#17604），两者要分开；2026-09-28 已解封（2.7）。
 5. **Cookie 效果**：#15690 的说法未经任何人验证；#14172 反例；业务机若测需用测试账号，并检查 hvc1 无声档。
 6. **App 端是否仍下发 `original_*` / `quality_type 10000`**：#7109 2023-06 有，2025-07 报失效。2026-09-24 证实 TikTok 保存着上传原片、tokcdn 能拿到（2.13.4），
    但 2026-09-27 用开源 App 签名拿不到 App 接口的任何 JSON（2.13.8），所以 App 阶梯里有没有原片档仍未知。
@@ -786,7 +796,7 @@ TikTok 走 App API 的路径（`_extract_aweme_app`，以及 Sound / Effect / Ta
 | `WARNING: [Douyin] Douyin original format is listed without probing (original_probe=false) ...` | `original=true` + `original_probe=false` 且输出 info JSON，整次运行打印一次 |
 | `Unknown Douyin strategies: 'web' (available: ...)` / `Unknown Douyin original_probe value: 'size'; write douyin:original_probe=true ...` / `Douyin extractor arg ... must be a list of strings` | 配置写错：旧策略名 `web` / `open` / `webpage`、`original_probe` 的旧取值 `none` / `size` / `full`（现为 `true` / `false`，原 `full` 即 `true`）、Python API 把值写成字符串或布尔值；在任何请求之前报出 |
 | `Douyin short link is invalid or expired` / `points to an unsupported page` | 短码失效，或短链指向图集、西瓜视频等（2.10） |
-| `TikTok webpage_hydration failed: Unexpected response from webpage request (HTTP 200, 612 bytes, blocked by risk control (X-TT-System-Error: 3))` | TikTok 网页被风控拦截页（不是视频不可用，#15644 / #17393 的判据），已自动回退到 `signed_web_api`；先看 `[debug] [TikTok] Impersonation target:` 与 curl_cffi 版本（#17604 chrome-150 被封） |
+| `TikTok webpage_hydration failed: Unexpected response from webpage request (HTTP 200, 612 bytes, blocked by risk control (X-TT-System-Error: 3))` | TikTok 网页被风控拦截页（不是视频不可用，#15644 / #17393 的判据），已自动回退到 `signed_web_api`；先看 `[debug] [TikTok] Impersonation target:` 与 curl_cffi 版本（#17604 chrome-150 曾被封，2026-09-28 已解封，见 2.7） |
 | `TikTok webpage_hydration failed: Unable to solve JS challenge (...)` / `Unable to extract universal data for rehydration (...)` / `no itemStruct in webpage hydration data` | WAF 挑战没解出、页面没有 hydration 数据或结构变了，括号里是 HTTP 状态码与页面大小；已回退到 `signed_web_api` |
 | `TikTok webpage_hydration failed: Unable to download webpage: HTTP Error 403: Forbidden` | 网页路径的 HTTP 错误原样透传（TLS 指纹 / IP 被拒等），已回退 |
 | `TikTok webpage_hydration failed: TikTok is requiring login for access to this content. ...` | 视频页 302 到 `/login`，多为对可疑 IP 的页面级风控，已回退到 `signed_web_api`；内容真需登录时是 `statusCode` 10216 / 10222 或 `isContentClassified`，那两种不回退 |

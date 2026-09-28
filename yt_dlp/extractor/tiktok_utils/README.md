@@ -396,8 +396,10 @@ Python API 写法（命令行等价写法见末尾）。与 douyin 一样，每�
 # 但本机实测（美国出口）对档位无影响，且上游 PR 15710 记录它可能引发 503 / 验证码页。业务机遇到只给低档时先做 A/B 再决定是否常开。
 # 'geo_bypass_country': 'US',          # 等同 --xff US
 
-# TLS 伪装目标只影响 webpage_hydration。curl_cffi 0.16.2 起的 chrome-150 目标 2026-09 被 TikTok 整体封（上游 issue 17604），
-# 出现「Unexpected response from webpage request」时先看 -v 里的 [debug] Impersonation target: 是什么。
+# TLS 伪装目标：网页渠道（webpage_hydration、用户页、直播页）要的是「任意目标」，yt-dlp 取 curl_cffi 支持的最新一个
+# （0.16.1 起为 chrome-150），这个请求级设置优先于全局 --impersonate，所以下面这项改不了网页渠道的目标，只会让 signed_web_api 也随之伪装。
+# chrome-150 在 2026-09 初被 TikTok 整体封过（上游 issue 17604），2026-09-28 实测已解封，fork 已恢复与上游一致；
+# 再被封时 webpage_hydration 报「Unexpected response from webpage request」并自动回退 signed_web_api，先看 -v 里的 [debug] Impersonation target:。
 # 'impersonate': 'chrome-146:macos',   # 等同 --impersonate
 
 # 登录 Cookie 只在「需登录」的错误时有用（私密 / 敏感内容），对画质档位没有已证实的作用（调研文档 2.13.2.1）；
