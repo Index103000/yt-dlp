@@ -39,6 +39,7 @@ class Logger:
 class FakeUrlh:
     def __init__(self, status=200, headers=None, url=API_URL):
         self.status, self.headers, self.url = status, headers or {}, url
+        self.extensions = {}
 
 
 def no_network(self, *args, **kwargs):
@@ -80,6 +81,19 @@ class TestTikTokStrategies(unittest.TestCase):
             return payload, FakeUrlh(status, headers)
         self.patch('_download_webpage_handle', fake_handle)
 
+    def use_login_redirect(self):
+        # 不替换 _extract_web_data_and_status，让它真实地看到视频页跳转到 /login，
+        # 这样文案一旦和 TikTokIE 识别用的前缀对不上（比如合并上游时被改），回退就会失败、测试会报出来
+        payload = json.dumps({'statusCode': 0, 'itemInfo': {'itemStruct': self.item}})
+
+        def fake_handle(ie, url, video_id, *args, **kwargs):
+            if url.startswith(API_URL):
+                self.calls.append('api')
+                return payload, FakeUrlh()
+            self.calls.append('webpage')
+            return '<html></html>', FakeUrlh(url='https://www.tiktok.com/login?redirect_url=%2F')
+        self.patch('_download_webpage_handle', fake_handle)
+
     def extract(self, strategies=None):
         opts = {'quiet': True, 'logger': self.logger, 'check_formats': False,
                 'extractor_args': {'tiktok': {'strategies': strategies or []}}}
@@ -111,6 +125,14 @@ class TestTikTokStrategies(unittest.TestCase):
         info = self.extract()
         self.assertEqual(info['id'], VIDEO_ID)
         self.assertEqual(self.calls, ['webpage', 'api'])
+
+    def test_real_login_redirect_falls_back_to_api(self):
+        self.use_login_redirect()
+        info = self.extract()
+        self.assertEqual(info['id'], VIDEO_ID)
+        self.assertEqual(self.calls, ['webpage', 'api'])
+        self.assertTrue(any('webpage_hydration failed: TikTok is requiring login' in w for w in self.logger.warnings),
+                        self.logger.warnings)
 
     def test_api_formats_use_play_mirror_only(self):
         self.use_api()

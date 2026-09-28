@@ -76,14 +76,6 @@ def build_aweme_detail_query(video_id):
     }
 
 
-def response_snippet(text, limit=200):
-    """
-    把响应体压成一行并截断，用于失败原因日志。
-    """
-    text = ' '.join((text or '').split())
-    return text if len(text) <= limit else f'{text[:limit]}...'
-
-
 def sign_aweme_detail_query(query, user_agent):
     """
     为 aweme/detail query 添加 a_bogus。

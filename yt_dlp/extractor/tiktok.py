@@ -18,7 +18,6 @@ from .tiktok_utils.douyin.api import (
     build_aweme_detail_query,
     build_open_aweme_detail_query,
     build_original_play_url,
-    response_snippet,
     sign_aweme_detail_query,
 )
 from .tiktok_utils.douyin.constants import (
@@ -54,6 +53,7 @@ from .tiktok_utils.tiktok.api import (
     build_item_detail_headers,
     build_item_detail_url,
 )
+from .tiktok_utils.utils import response_snippet
 from ..networking import HEADRequest, Request
 from ..utils import (
     ExtractorError,
@@ -84,6 +84,8 @@ from ..utils.traversal import find_element, require, traverse_obj
 
 class TikTokBaseIE(InfoExtractor):
     _UPLOADER_URL_FORMAT = 'https://www.tiktok.com/@%s'
+    # _extract_web_data_and_status 里视频页跳转到 /login 时的文案；TikTokIE 按这个前缀识别并回退到下一渠道，所以两处必须引用同一个常量
+    _LOGIN_REDIRECT_MESSAGE = 'TikTok is requiring login for access to this content'
     _WEBPAGE_HOST = 'https://www.tiktok.com/'
     QUALITIES = ('360p', '540p', '720p', '1080p')
 
@@ -391,7 +393,7 @@ class TikTokBaseIE(InfoExtractor):
             self.write_debug(f'Impersonation target: {urlh.extensions.get("impersonate")}')
 
             if urllib.parse.urlparse(urlh.url).path == '/login':
-                message = 'TikTok is requiring login for access to this content'
+                message = self._LOGIN_REDIRECT_MESSAGE
                 if fatal:
                     self.raise_login_required(message)
                 self.report_warning(f'{message}. {self._login_hint()}', video_id=video_id)
@@ -716,10 +718,6 @@ class TikTokBaseIE(InfoExtractor):
         # 用于让顶层 playAddr 通过 PlayAddrStruct.UrlKey 反查 bitrateInfo 的完整 metadata
         bitrate_meta_by_url_key = {}
 
-        # 用于让顶层 playAddr 通过 URL 反查 bitrateInfo 的完整 metadata
-        # 某些情况下 PlayAddrStruct.UrlKey 缺失，但 URL 与 bitrateInfo URL 一致。
-        bitrate_meta_by_url = {}
-
         # 1. 优先加入 bitrateInfo formats
         # 这部分 metadata 通常最完整，所以放在 play/download 前面。
         # _remove_duplicate_formats 只按 URL 去重，不合并 metadata；
@@ -749,8 +747,6 @@ class TikTokBaseIE(InfoExtractor):
 
             for video_url in traverse_obj(play_addr, ('UrlList', ..., {url_or_none})):
                 normalized_url = self._proto_relative_url(video_url)
-
-                bitrate_meta_by_url[normalized_url] = format_info.copy()
 
                 formats.append({
                     **COMMON_FORMAT_INFO,
@@ -825,22 +821,14 @@ class TikTokBaseIE(InfoExtractor):
             play_urls = [
                 play_url for play_url in traverse_obj(play_addr_struct, ('UrlList', ..., {url_or_none}))
                 if urllib.parse.urlparse(play_url).hostname == 'www.tiktok.com'] or play_urls
+        # 与某档 bitrateInfo 地址相同的 play 会被下面的 _remove_duplicate_formats 去掉（bitrateInfo 先 append，保留先出现的），
+        # 实测网页与 signed_web_api 两条渠道都是这种情况，所以这里不必再按 URL 反查 bitrateInfo 的 metadata
         for play_url in play_urls:
-            normalized_url = self._proto_relative_url(play_url)
-
-            # 如果 play URL 和某个 bitrateInfo URL 一致，则复用 bitrateInfo metadata；
-            # 但 format_id 仍保留为 play，方便 list-formats 看出来源。
-            matched_meta = bitrate_meta_by_url.get(normalized_url, {}).copy()
-            if matched_meta:
-                current_play_meta = matched_meta
-            else:
-                current_play_meta = play_meta.copy()
-
             formats.append({
                 **COMMON_FORMAT_INFO,
-                **filter_dict(current_play_meta),
+                **play_meta,
                 'format_id': 'play',
-                'url': normalized_url,
+                'url': self._proto_relative_url(play_url),
             })
 
         # 3. 解析 downloadAddr
@@ -1252,8 +1240,6 @@ class TikTokIE(TikTokBaseIE):
     _TIKTOK_STRATEGIES = ('webpage_hydration', 'signed_web_api')
     # signed_web_api 渠道解析格式时置 True，见 _extract_web_formats
     _tiktok_play_mirror_only = False
-    # _extract_web_data_and_status 里视频页跳转到 /login 时 raise_login_required 的文案前缀，用来识别并回退
-    _LOGIN_REDIRECT_MESSAGE = 'TikTok is requiring login for access to this content'
 
     def _real_extract(self, url):
         video_id, user_id = self._match_valid_url(url).group('id', 'user_id')
@@ -1873,13 +1859,10 @@ class DouyinIE(TikTokBaseIE):
     _douyin_original = False
     _douyin_original_probe = True
 
-    def _douyin_extractor_arg(self, key, default):
-        # 读 --extractor-args "douyin:<key>=..."，校验与报错文案见 TikTokBaseIE._list_extractor_arg（与 TikTokIE 共用）
-        return self._list_extractor_arg(key, default)
-
     def _douyin_bool_arg(self, key, default):
+        # 读 --extractor-args "douyin:<key>=..."，校验与报错文案见 TikTokBaseIE._list_extractor_arg（与 TikTokIE 共用）；
         # 没配置或空列表按默认；CLI 只写 "douyin:original"（不带 =）时 yt-dlp 给出 ['']
-        values = self._douyin_extractor_arg(key, [])
+        values = self._list_extractor_arg(key, [])
         if not values:
             return default
         if len(values) > 1 or values[0] not in ('true', 'false'):

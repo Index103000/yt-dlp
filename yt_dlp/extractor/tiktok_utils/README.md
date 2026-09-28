@@ -6,6 +6,7 @@ yt_dlp/extractor/
 └── tiktok_utils/
     ├── __init__.py
     ├── formats.py
+    ├── utils.py
     ├── docs/
     │   └── douyin-risk-control-research.md
     ├── tiktok/
@@ -45,6 +46,10 @@ tiktok_utils/formats.py
     - resolution / quality 归一化
     - PlayAddr / bitrateInfo / bitRateList 元信息提取
 
+tiktok_utils/utils.py
+    TikTok / Douyin 共用的小工具：
+    - response_snippet                失败原因日志用的响应体摘要（压成一行并截断）
+
 tiktok_utils/douyin/constants.py
     Douyin 固定 UA、host、默认 headers、embed_origin_api 的 open.douyin.com 来源 headers、__ac_signature 的 site 参数
 
@@ -82,7 +87,6 @@ tiktok_utils/douyin/api.py
     - build_aweme_detail_query        signed_web_api
     - sign_aweme_detail_query
     - build_original_play_url         上传原片地址（/aweme/v1/play/?ratio=default）
-    - response_snippet                失败原因日志用的响应体摘要
 
 tiktok_utils/douyin/websign.py
     Argus 的 x-secsdk-web-signature（webSign）纯算实现：
