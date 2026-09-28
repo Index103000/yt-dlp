@@ -4,9 +4,12 @@
   同日实现 web API 签名（改为第一级）、原片探测，并调研 TikTok 原片；当晚策略改名为 `signed_web_api` / `embed_origin_api` /
   `ssr_render_data`，原片改为 `original=true` 时才列出、按分辨率排序并默认探测；2026-09-23 修正 API 路径水印版 `download_addr` 的排序与宽高；
   同日跨项目调研 TikTok 下载方案（2.13）并接入第二渠道 `signed_web_api`（2.7.1）；2026-09-24 证实 TikTok 保存着上传原片、只有第三方拿得到（2.13.4）；
-  2026-09-27 验证开源 App 签名不可行（2.13.8），并改写历史去掉提交说明里指向上游的编号（3.3）
+  2026-09-27 验证开源 App 签名不可行（2.13.8），并改写历史去掉提交说明里指向上游的编号（3.3）；
+  2026-09-28 原片探测改为按容器补齐信息：支持 WebM / MKV，其他容器或解析失败时用 ffprobe 兜底（2.9）
 - 适用分支：`tiktok`
-- 对应代码：`yt_dlp/extractor/tiktok.py`（`DouyinIE`、`TikTokBaseIE._extract_web_formats`）、`yt_dlp/extractor/tiktok_utils/douyin/*`
+- 对应代码：`yt_dlp/extractor/tiktok.py`（`DouyinIE`、`TikTokIE` 的两条渠道、`TikTokBaseIE._extract_web_formats`）、
+  `yt_dlp/extractor/tiktok_utils/douyin/*`（抖音签名、Cookie、原片探测）、`yt_dlp/extractor/tiktok_utils/tiktok/*`（TikTok 签名接口）；
+  测试在 `test/test_douyin_mediaprobe.py`、`test/test_tiktok_strategies.py`、`test/test_tiktok_utils_websign.py`
 
 本文记录实测结论和证据，以及调研时参考过的外部项目。风控随时会变，这里的结论都有时效性：
 出问题时先按「3. 排查方法」复测，再对照本文判断是哪一层变了；外部项目的新方案见「4. 参考项目」。
@@ -440,7 +443,7 @@ User-Agent: com.ss.android.ugc.aweme/300904 (Linux; U; Android 12; zh_CN; SM-G97
   moov 在 ≤90 秒的样本里为 7–116KB，20 分钟的视频为 1.2MB。两步差别很小，所以不再分 `size` / `full` 两档，开探测就读全。
 - 探测失败：第一个请求失败时保留未探测的原片，但 `quality` 降为 0（转码档之下），不作为默认选择，需要时 `-f original`；
   moov 一步失败时保留第一步的结果。两种情况都打印 WARNING，因为 info JSON 里原片的编码等信息会缺。
-- `original_probe=false`：不多发请求，但编码、大小、容器未知，识别不了「假原片」，QuickTime 原片会存成 `.mp4`，
+- `original_probe=false`：不多发请求，但编码、大小、容器未知，识别不了「假原片」，QuickTime / WebM 等非 MP4 原片也会存成 `.mp4`，
   `-S vcodec` / `-S size` 等规则对原片无效；此时若输出 info JSON（`--write-info-json` / `-j` / `-J`；`--embed-info-json` 不在检查范围内），
   整次运行打印一次 WARNING（设置了自定义 logger 时 yt-dlp 不去重，每个视频一次）。
   另外 `best[vcodec!=none]` 这类筛选会排除编码未知的原片（格式筛选里未知值不满足 `!=`，要写 `vcodec!=?none` 才放行）。
@@ -939,6 +942,9 @@ TikTok 方向 2026-09-23 跨项目调研新增的参考项目（yt-dlp 上游各
      可考虑下载 / 探测遇到 403 时换带 Referer 的请求重试一次；
    - 回退为转码档的规律不清楚（2021 年视频 4 个中 1 个），`te_is_reencode`、`transType`、`isFastImport` 等剪辑器标签的含义未核实；
    - 旋转：`mp4probe` 按 `tkhd` 矩阵换算显示宽高，ffmpeg 合成的 90° 样本结果正确，但抖音原片样本里没有带旋转矩阵的，真实文件未验证；
+     Matroska 的旋转（Projection）没有读取，宽高按编码尺寸给出；
+   - 2026-09-28 容器探测审查留下的低优先级项（未改）：非方形像素时内置解析与 ffprobe 的宽度口径不同（内置取编码宽度）；
+     ffprobe 探测原片 CDN 时不校验 TLS 证书（与 yt-dlp 自己调用 ffmpeg 下载一致）；WebM 原片没有 `vbr` / `abr`（Matroska 不存分轨大小）；
    - 海外出口的原片被调度到 `v5-dy-ov-experiment.zjcdn.com`，曾出现一次 TLS 建连失败（换出口后成功），偶发性未量化。
 4. **TikTok**：第二渠道 `signed_web_api` 已接入（2.7.1），但它对「1080p→540p」是否有效未验；业务机「1080p→540p」的分型与缓解（XFF US、`/api/item/detail/` 第二路径、换出口）只能在业务机上按 2.13.2.3 排查，本机出口是美国测不了；
    完整的未解决清单见 2.13.6。登录 Cookie「稳定 1080p」的说法复核不成立（2.13.2.1），只保留为实验项；签名 App API 在开源侧没有可用实现，

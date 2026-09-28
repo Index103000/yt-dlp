@@ -249,7 +249,7 @@ Python API 写法（命令行等价写法见末尾）。每个值都必须是「
         #     内置解析与 ffprobe 都没补齐时保留大小 / 码率，缺编码与 fps，同样打印 WARNING（原因里写明缺 ffprobe 等）。
         # 'false'：不多发请求，但只知道宽高：
         #   - vcodec 未知，best[vcodec!=none] 这类筛选会把原片排除（要放行需写 vcodec!=?none）；
-        #   - -S vcodec / -S size 等规则对它无效；QuickTime 原片会被存成 .mp4；识别不了假原片；
+        #   - -S vcodec / -S size 等规则对它无效；QuickTime / WebM 等非 MP4 原片也会被存成 .mp4；识别不了假原片；
         #   - 若同时输出 info.json（--write-info-json / -j / -J），整次运行打印一次 WARNING 提示元数据不全
         #     （设置了自定义 logger 时 yt-dlp 不去重，每个视频一次）。
         'original_probe': ['true'],
