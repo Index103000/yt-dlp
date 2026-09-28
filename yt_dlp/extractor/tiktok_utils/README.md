@@ -24,11 +24,15 @@ yt_dlp/extractor/
         ├── api.py
         ├── websign.py
         ├── mp4probe.py
+        ├── mediaprobe.py
         └── render_data.py
 
 test/
 ├── test_tiktok_utils_websign.py          TikTok 签名器的离线向量测试
-└── testdata/tiktok/websign_vectors.json  向量（Evil0ctal tests/unit/test_signing.py 的 TIKTOK_VECTORS + 浏览器抓包）
+├── test_tiktok_strategies.py             TikTok 两条渠道的离线回退测试
+├── test_douyin_mediaprobe.py             抖音原片探测：容器识别、MP4 / Matroska 解析、ffprobe 兜底
+├── testdata/tiktok/                      TikTok 签名向量与 itemStruct 样本
+└── testdata/douyin/probe_*               ffmpeg 生成的 0.4 秒小样本（WebM / MKV / MP4 / MOV / FLV，各 4–7KB）
 ```
 
 各模块职责如下：
@@ -89,6 +93,12 @@ tiktok_utils/douyin/mp4probe.py
     上传原片探测用的最小 MP4 / QuickTime 解析（不下载整个文件）：
     - parse_top_level                 文件头里的 brand 与顶层 box
     - parse_moov                      vcodec / acodec / 宽高 / fps / vbr / abr / dynamic_range
+
+tiktok_utils/douyin/mediaprobe.py
+    上传原片的容器识别与其他容器：
+    - sniff_container                 按文件头魔数识别 mp4 / mov / webm / mkv
+    - parse_matroska / parse_matroska_tracks   WebM / MKV 头部的 Tracks（编码、宽高、fps、HDR），Tracks 不在头部时给出偏移
+    - ffprobe_info                    ffprobe JSON → yt-dlp format 字段（其他容器的兜底）
 
 tiktok_utils/douyin/render_data.py
     Douyin ssr_render_data（精选页 SSR）：
@@ -176,7 +186,8 @@ tiktok_utils/tiktok/api.py
 
 - 排序：`quality` 取「短边不超过原片的转码档」中最大的 `quality` 再加 0.5（留 16px 余量），排在同档转码档之上，所以默认选择就是它；
   两条路径都成立（`ssr_render_data` 的转码档没有档位名，`quality` 按实际短边补上）。`-S` 等用户排序规则同样作用于它，`-f worst` 仍是水印版；
-- 探测：默认先读文件头与 moov（`mp4probe.py`），补全编码、大小、fps、HDR、容器（mov / mp4），并去掉回退成转码档的「假原片」。
+- 探测：默认先读文件头，按容器补全编码、大小、fps、HDR、容器（mp4 / mov 读 moov，webm / mkv 读头部 Tracks，其他容器或解析失败时用 ffprobe），
+  并去掉回退成转码档的「假原片」。
   代价：国内直连每个视频多约 0.2–0.6 秒，海外代理 10–20 秒。探测的第一个请求失败时原片降到转码档之下，不作为默认；
   `douyin:original_probe=false` 可关闭，此时信息不全，若输出 info JSON（`--write-info-json` / `-j` / `-J`）整次运行警告一次；
 - 原片跳转到的冷存储节点对带 `Referer` 的请求可能 403，所以它的 `http_headers` 为 `{}`。
@@ -227,12 +238,15 @@ Python API 写法（命令行等价写法见末尾）。每个值都必须是「
         # ── 原片是否在下载前探测 ────────────────────────────────────────────────────────
         # 可选值：'true' / 'false'。默认 'true'。只在 original=true 时有意义。
         # 旧值 none / size / full 已废弃（原 full 即 true），传入会报错。
-        # 'true'：多发 3 个 HTTP 请求（302 跳转、文件头 4KB、文件尾 moov），国内直连每个视频多约 0.2–0.6 秒，
-        #   海外代理多约 10–20 秒。得到：
-        #   - 精确 filesize、tbr（平均码率）、ext（mov / mp4）、vcodec、acodec、fps、vbr、abr、dynamic_range（SDR / HDR10 / HLG）；
+        # 'true'：MP4 / MOV 原片多发 3 个 HTTP 请求（302 跳转、文件头 4KB、文件尾 moov），WebM / MKV 原片多发 2 个（编码信息在文件头里），
+        #   国内直连每个视频多约 0.2–0.6 秒，海外代理多约 10–20 秒。认不出的容器（FLV / AVI / TS 等）或解析失败时，
+        #   若能找到 ffprobe（--ffmpeg-location 或 PATH），用它直接探测原片地址补齐（约 1 秒；出口与 yt-dlp 相同，
+        #   只支持明文 http 代理，https / SOCKS 代理时跳过 ffprobe）。得到：
+        #   - 精确 filesize、tbr（平均码率）、ext（mp4 / mov / webm / mkv / ffprobe 识别的其他容器）、vcodec、acodec、fps、
+        #     vbr、abr（WebM 没有这两项）、dynamic_range（SDR / HDR10 / HLG）；
         #   - 识别「假原片」（ratio=default 其实返回了转码档）并去掉，避免下错；
         #   - 探测的第一个请求失败时，原片保留但降到所有转码档之下、不作为默认，并打印 WARNING；
-        #     只有 moov 读取失败时保留大小 / 码率 / 容器，缺编码与 fps，同样打印 WARNING。
+        #     内置解析与 ffprobe 都没补齐时保留大小 / 码率，缺编码与 fps，同样打印 WARNING（原因里写明缺 ffprobe 等）。
         # 'false'：不多发请求，但只知道宽高：
         #   - vcodec 未知，best[vcodec!=none] 这类筛选会把原片排除（要放行需写 vcodec!=?none）；
         #   - -S vcodec / -S size 等规则对它无效；QuickTime 原片会被存成 .mp4；识别不了假原片；

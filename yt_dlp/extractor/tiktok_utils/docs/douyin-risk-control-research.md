@@ -405,7 +405,7 @@ User-Agent: com.ss.android.ugc.aweme/300904 (Linux; U; Android 12; zh_CN; SM-G97
 覆盖掉 info 级 Referer（yt-dlp 的 `_calc_headers(ChainMap(fmt, info))` 以格式级为准，`--load-info-json` 与外部下载器同样生效；
 用户显式 `--referer` / `--add-headers` 仍会加上）。
 
-**实现**（`DouyinIE._add_douyin_original_format`、`_douyin_original_quality`、`_probe_douyin_original`、`tiktok_utils/douyin/mp4probe.py`）：
+**实现**（`DouyinIE._add_douyin_original_format`、`_douyin_original_quality`、`_probe_douyin_original`、`tiktok_utils/douyin/mp4probe.py`、`mediaprobe.py`）：
 
 - 默认不列出；`--extractor-args "douyin:original=true"` 时列出 `format_id='original'`，宽高先取 `video.width/height`、ext 为 mp4。
 - 排序：`preference` 与转码档相同（-1）；`quality` 按分辨率归档，取「短边不超过原片的转码档」里最大的 `quality` 再加 0.5
@@ -415,9 +415,26 @@ User-Agent: com.ss.android.ugc.aweme/300904 (Linux; U; Android 12; zh_CN; SM-G97
   SSR 方案的 `bitRateList` 没有 UrlKey，转码档的 `quality` 按实际短边补上（与 yt-dlp 的 `res` 同值，转码档之间的顺序不变），原片同样按档位归档。
   归档比较留 16px 余量，免得奇数边取整或探测宽高有 1–2px 出入时掉一整档。
 - 探测（`original_probe`，默认开）：先发 1 个 `Range: bytes=0-4095`（跟随 302，约 2 个 HTTP 请求），得到精确 `filesize`、
-  `tbr`（大小 × 8 / 时长）、`ext`（brand 为 `qt` 时 `mov`）；跳转后的对象 ID 与某转码档相同、或大小等于某档 `data_size` 即判为回退，
-  去掉 original（打印 `The original upload is no longer available ...`）。再发 1 个 Range 取文件尾的 moov，纯 Python 解析出
-  `vcodec`、`acodec`、`fps`（平均帧率）、`vbr`、`abr`、`dynamic_range`（colr 的 transfer：16 为 HDR10、18 为 HLG；没有 colr 时不下结论）与显示宽高。
+  `tbr`（大小 × 8 / 时长）；跳转后的对象 ID 与某转码档相同、或大小等于某档 `data_size` 即判为回退，
+  去掉 original（打印 `The original upload is no longer available ...`）。然后按文件头魔数识别容器，分别补全：
+  - **MP4 / QuickTime**（`ftyp`，brand 为 `qt` 时 `mov`；没有 `ftyp`、以 `wide` / `mdat` / `moov` 等开头的老式 QuickTime 也认）：再发 1 个 Range 取文件尾的 moov，纯 Python 解析出
+    `vcodec`、`acodec`、`fps`（平均帧率）、`vbr`、`abr`、`dynamic_range`（colr 的 transfer：16 为 HDR10、18 为 HLG；没有 colr 时不下结论）与显示宽高；
+  - **WebM / MKV**（EBML 头，`DocType` 为 `webm` 时 ext 为 `webm`，否则 `mkv`）：从已读的文件头解析 Tracks，得到 `vcodec`（V_VP9 → vp9、V_AV1 → av01 等）、
+    `acodec`、宽高、`fps`（DefaultDuration）、`dynamic_range`（TransferCharacteristics）；Lavf 封装的 Tracks 在前 500 字节内，不多发请求；
+    不在文件头、或被 4KB 文件头截断时，从 Tracks 起点（SeekHead 给出或截断处的元素起点）再取 1 次，截断的元素不读值。
+    认不出的 CodecID（如 `V_MS/VFW/FOURCC`）不算解析成功，交给 ffprobe。WebM 不存分轨大小，没有 `vbr` / `abr`。
+    实例：用户把 YouTube 下载的 WebM（VP9 3840x2160 + Opus）上传到抖音（7688933470114024746），原片就是这个 WebM；
+    2026-09-28 之前只认 MP4，把 EBML 头当 box 解析，报 `Unexpected moov range 440786851-20780257`、ext 标成 mp4、编码未知，
+    被用户选择器里的 `[vcodec!=none]` 排除，实际下载会悄悄落到 720p 转码档；
+  - **其他容器或上面解析失败**：若装了 ffprobe（`--ffmpeg-location` 或 PATH），直接探测 302 之后的 CDN 地址补全全部字段与 ext
+    （FLV / AVI / TS 等），带相同 UA、不带 Referer，`-probesize 2000000`（限制的是分析流信息读的量；moov 在尾的 MP4 实测共读约 3.5MB、
+    3 个请求）、`-rw_timeout` 15 秒、整体 60 秒超时；实测对抖音 WebM 原片 0.7 秒、moov 在尾的 MOV 原片 1.1 秒，结果与内置解析一致。
+    出口与 yt-dlp 自己的请求相同（`--proxy` / 环境变量 / 系统代理经 `clean_proxies` + `select_proxy` 选出）。ffmpeg 只支持明文 http 代理，
+    而且只认小写 `http://` 前缀（`HTTP://`、`https://` 会被它静默忽略而直连），所以 http 代理统一改写成小写前缀、经环境变量 `http_proxy` 传入
+    （不放命令行，`ps` 看不到密码），https / SOCKS 代理跳过 ffprobe；yt-dlp 判定直连（如 `--proxy ""`）时去掉环境里的 `http_proxy` / `no_proxy`。
+    编码已知但缺帧率（fMP4 的 moov 没有样本表、没有 DefaultDuration 的 WebM）时也悄悄用 ffprobe 补一次，失败不告警。
+    内置解析与 ffprobe 都失败时保留大小、码率等已知字段并警告，ext 保留默认的 mp4。
+    原片字节由上传者控制：超过 8 字节的整数字段、截断的元素、畸形的 ffprobe 数值都按「读不到」处理，解析中的任何异常都转成失败原因，不影响提取。
 - 探测代价（直连 6 个视频、海外代理 3 个）：国内直连整体 0.18–0.61s（旧 `size` 模式只取文件头为 0.17–0.45s）；
   海外代理 9.8–20.0s，大头在第一个请求（302 + CDN 首包，8.2–16.9s），moov 一步只占 1.1–1.9s（复用连接）。
   moov 在 ≤90 秒的样本里为 7–116KB，20 分钟的视频为 1.2MB。两步差别很小，所以不再分 `size` / `full` 两档，开探测就读全。
@@ -761,7 +778,8 @@ TikTok 走 App API 的路径（`_extract_aweme_app`，以及 Sound / Effect / Ta
 | `ssr_render_data: RENDER_DATA has no videoDetail` | 页面结构变化，或视频不可用 |
 | `<id>: The original upload is no longer available (ratio=default returned a transcoded format); not listing the original format` | 探测识别出原片回退为转码档，已去掉 `original` |
 | `WARNING: ... Unable to probe the Douyin original upload (...); listing it unprobed below the transcodes, ...` | 探测的第一个请求失败：原片保留但降到转码档之下，不作为默认；下载 `-f original` 时若 403，先看落到的 CDN 节点与请求是否带了 Referer（2.9） |
-| `WARNING: ... Unable to read the codec info of the Douyin original upload ...` / `Unexpected moov range ...` | moov 没读到，原片仍是默认选择，但 info JSON 缺编码与 fps |
+| `WARNING: ... Unable to read the codec info of the Douyin original upload (<内置解析的原因>; <ffprobe 的原因>) ...` | 内置解析（MP4 moov / Matroska Tracks）与 ffprobe 都没补全：原片仍是默认选择，但编码未知，info JSON 缺编码与 fps，`[vcodec!=none]` 会排除它。括号里前半是内置解析的原因（如 `unrecognized container (first bytes ...)`、`unexpected moov range ...`），后半是 ffprobe 的原因（`ffprobe not found ...` 时装 ffmpeg 或设 `--ffmpeg-location`；`does not support the socks5 proxy`；`exited with code N` 等） |
+| `<id>: Probing Douyin original upload with ffprobe` | 内置解析认不出容器或失败，改用 ffprobe 补全；成功时 `-v` 里有 `... filled in with ffprobe` |
 | `WARNING: [Douyin] Douyin original format is listed without probing (original_probe=false) ...` | `original=true` + `original_probe=false` 且输出 info JSON，整次运行打印一次 |
 | `Unknown Douyin strategies: 'web' (available: ...)` / `Unknown Douyin original_probe value: 'size'; write douyin:original_probe=true ...` / `Douyin extractor arg ... must be a list of strings` | 配置写错：旧策略名 `web` / `open` / `webpage`、`original_probe` 的旧取值 `none` / `size` / `full`（现为 `true` / `false`，原 `full` 即 `true`）、Python API 把值写成字符串或布尔值；在任何请求之前报出 |
 | `Douyin short link is invalid or expired` / `points to an unsupported page` | 短码失效，或短链指向图集、西瓜视频等（2.10） |

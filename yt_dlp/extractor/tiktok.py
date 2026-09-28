@@ -3,9 +3,11 @@ import functools
 import hashlib
 import itertools
 import json
+import os
 import random
 import re
 import string
+import subprocess
 import time
 import urllib.parse
 import uuid
@@ -32,6 +34,7 @@ from .tiktok_utils.douyin.cookies import (
     get_douyin_uifid,
     store_douyin_uifid,
 )
+from .tiktok_utils.douyin.mediaprobe import ffprobe_info, parse_matroska, parse_matroska_tracks, sniff_container
 from .tiktok_utils.douyin.mp4probe import parse_moov, parse_top_level
 from .tiktok_utils.douyin.render_data import (
     extract_render_data_json,
@@ -54,6 +57,7 @@ from .tiktok_utils.tiktok.api import (
 from ..networking import HEADRequest, Request
 from ..utils import (
     ExtractorError,
+    Popen,
     UnsupportedError,
     UserNotLive,
     determine_ext,
@@ -74,6 +78,7 @@ from ..utils import (
     url_or_none,
     urlencode_postdata,
 )
+from ..utils.networking import HTTPHeaderDict, clean_proxies, select_proxy
 from ..utils.traversal import find_element, require, traverse_obj
 
 
@@ -2046,13 +2051,20 @@ class DouyinIE(TikTokBaseIE):
         """
         下载前探测原片，返回 (补全后的格式, 第一个请求是否成功)；判定为回退（不是原片）时格式为 None，由调用方去掉。
 
-        1. 1 次 Range 请求（跟随 302，约 2 个 HTTP 请求）取文件头 4KB，得到精确大小、平均码率、容器（qt → mov），
+        1. 1 次 Range 请求（跟随 302，约 2 个 HTTP 请求）取文件头 4KB，得到精确大小、平均码率，按魔数识别容器，
            并识别回退：跳转后的对象 ID 与某个转码档相同，或大小等于某档 data_size；
-        2. 再 1 次 Range 取文件尾的 moov（复用连接），得到编码、帧率、音视频码率、HDR，宽高改用文件里的值。
+        2. 按容器补全编码、帧率、宽高、HDR：
+           - MP4 / QuickTime（ftyp）：再 1 次 Range 取文件尾的 moov（mp4probe），还能得到音视频码率；
+           - WebM / MKV（EBML）：Tracks 通常就在已读的文件头里（mediaprobe），不在时按 SeekHead 的位置再取 1 次；
+           - 其他容器或上面解析失败（原片字节由上传者控制，任何解析异常都按失败处理）：若装了 ffprobe，
+             用它直接探测 CDN 地址（mediaprobe.ffprobe_info）。它按需发 Range 请求，-probesize 2MB 限制的是
+             分析流信息读的量，moov 在尾的 MP4 实测共读约 3.5MB、3 个请求；整体 60 秒超时。
+           - 拿到了编码但缺帧率（如 fMP4、没有 DefaultDuration 的 WebM）时，也用 ffprobe 补一次，失败不告警。
 
-        第 2 步只多 1 个请求：国内直连整体 0.2–0.6 秒（只做第 1 步为 0.2–0.5 秒），海外代理 10–20 秒（第 2 步占 1–2 秒）；
+        MP4 的第 2 步只多 1 个请求：国内直连整体 0.2–0.6 秒（只做第 1 步为 0.2–0.5 秒），海外代理 10–20 秒（第 2 步占 1–2 秒）；
         moov 通常 7–120KB，20 分钟的视频约 1.2MB。探测失败不影响提取：第 1 步失败时保留未探测的原片、降为非默认；
-        第 2 步失败时保留第 1 步的结果。两种情况都打印警告，因为 info JSON 里的原片信息会不全。
+        第 2 步（含 ffprobe）都失败时保留第 1 步的结果并警告，因为 info JSON 里的原片编码等信息会缺，
+        而且 best[vcodec!=none] 这类筛选会排除编码未知的原片。
         """
         # 与下载时一致，不带 Referer（见 _add_douyin_original_format 里 http_headers 的说明）
         headers = {'User-Agent': DOUYIN_USER_AGENT}
@@ -2082,34 +2094,62 @@ class DouyinIE(TikTokBaseIE):
                 'not listing the original format')
             return None, True
 
-        brand, boxes = parse_top_level(head)
+        container = sniff_container(head)
         original.update(filter_dict({
             'filesize': total,
             'tbr': round(total * 8 / duration_ms) if total and duration_ms else None,
-            'ext': 'mov' if brand and brand.startswith('qt') else 'mp4',
+            # 认不出容器时先保留默认的 mp4，ffprobe 补齐时再改
+            'ext': container,
         }))
-        # 服务器不支持 Range 时不做 moov 探测，免得把整个原片（常见上百 MB）读进内存
-        if not total or not boxes or urlh.status != 206:
+        # 服务器不支持 Range 时不做后续探测：moov、Tracks、ffprobe 都可能把整个原片（常见上百 MB）读下来
+        if not total or urlh.status != 206:
             self.report_warning(
                 'Unable to read the codec info of the Douyin original upload '
                 f'(HTTP {urlh.status}, size {total}); the info JSON will lack its codec and fps', video_id)
             return original, True
 
+        try:
+            if container in ('mp4', 'mov'):
+                reason = self._probe_douyin_original_moov(original, head, urlh.url, total, headers, video_id)
+            elif container in ('webm', 'mkv'):
+                reason = self._probe_douyin_original_matroska(original, head, urlh.url, total, headers, video_id)
+            else:
+                reason = f'unrecognized container (first bytes {head[:8].hex()})'
+        except Exception as e:  # 原片字节由上传者控制；畸形数据导致的任何异常都交给 ffprobe，不影响提取
+            reason = f'unable to parse the {container or "unknown"} container: {type(e).__name__}'
+        if not reason and original.get('fps'):
+            return original, True
+
+        ffprobe_reason = self._ffprobe_douyin_original(original, urlh.url, headers['User-Agent'], video_id)
+        if not reason:
+            # 编码已知、只缺帧率：ffprobe 只是锦上添花，失败时不告警
+            self.write_debug(f'Douyin original upload of {video_id}: fps unknown; '
+                             + (ffprobe_reason or 'filled in with ffprobe'))
+        elif ffprobe_reason:
+            self.report_warning(
+                f'Unable to read the codec info of the Douyin original upload ({reason}; {ffprobe_reason}); '
+                'the info JSON will lack its codec and fps', video_id)
+        else:
+            self.write_debug(f'Douyin original upload of {video_id}: {reason}; filled in with ffprobe')
+        return original, True
+
+    def _probe_douyin_original_moov(self, original, head, url, total, headers, video_id):
+        """MP4 / QuickTime：取 moov 解析，成功返回 None，否则返回失败原因。"""
+        _, boxes = parse_top_level(head)
+        if not boxes:
+            return 'no MP4 boxes in the file head'
         # moov 通常紧跟在 mdat 之后、位于文件尾；少数文件 moov 在头部
         moov_start, moov_end = next(
             ((start, end) for box_type, start, end in boxes if box_type == b'moov'), (boxes[-1][2], total))
         moov_end = min(moov_end, total)
         if not 0 < moov_end - moov_start <= 16 * 1024 * 1024:
-            self.report_warning(
-                f'Unexpected moov range {moov_start}-{moov_end} of {total} in the Douyin original upload; '
-                'the info JSON will lack its codec and fps', video_id)
-            return original, True
+            return f'unexpected moov range {moov_start}-{moov_end} of {total}'
         try:
             if moov_end <= len(head):
                 moov = head[moov_start:moov_end]
             else:
                 moov_urlh = self._request_webpage(
-                    Request(urlh.url, headers={**headers, 'Range': f'bytes={moov_start}-{moov_end - 1}'}), video_id,
+                    Request(url, headers={**headers, 'Range': f'bytes={moov_start}-{moov_end - 1}'}), video_id,
                     'Probing Douyin original upload metadata')
                 try:
                     if moov_urlh.status != 206:
@@ -2117,12 +2157,81 @@ class DouyinIE(TikTokBaseIE):
                     moov = moov_urlh.read(moov_end - moov_start)
                 finally:
                     moov_urlh.close()
-            original.update(parse_moov(moov))
-        except Exception as e:  # 同上
-            self.report_warning(
-                f'Unable to read the codec info of the Douyin original upload ({e}); '
-                'the info JSON will lack its codec and fps', video_id)
-        return original, True
+            info = parse_moov(moov)
+        except Exception as e:  # 可选的探测，失败时交给 ffprobe
+            return f'unable to read moov: {e}'
+        original.update(info)
+        return None if info.get('vcodec') else 'no video track in moov'
+
+    def _probe_douyin_original_matroska(self, original, head, url, total, headers, video_id):
+        """WebM / MKV：从文件头解析 Tracks，不在头部或不完整时再取一次；成功返回 None，否则返回失败原因。"""
+        info = parse_matroska(head)
+        tracks_offset = info.pop('tracks_offset', None)
+        info.pop('doctype', None)
+        # Tracks 不在文件头里或被文件头截断：从它的起点再取一次（64KB 足够容纳常见的 Tracks）
+        if tracks_offset is not None:
+            if not 0 < tracks_offset < total:
+                return f'unexpected Tracks offset {tracks_offset} of {total}'
+            try:
+                tracks_urlh = self._request_webpage(
+                    Request(url, headers={
+                        **headers, 'Range': f'bytes={tracks_offset}-{min(tracks_offset + 65535, total - 1)}'}),
+                    video_id, 'Probing Douyin original upload metadata')
+                try:
+                    if tracks_urlh.status != 206:
+                        raise ValueError(f'expected HTTP 206 for the Tracks range, got {tracks_urlh.status}')
+                    info = parse_matroska_tracks(tracks_urlh.read(65536))
+                finally:
+                    tracks_urlh.close()
+            except Exception as e:  # 可选的探测，失败时交给 ffprobe
+                return f'unable to read Matroska Tracks: {e}'
+        original.update(info)
+        return None if info.get('vcodec') else 'no video track in Matroska Tracks'
+
+    def _ffprobe_douyin_original(self, original, url, user_agent, video_id):
+        """
+        用 ffprobe 探测原片 CDN 地址补全格式字段；成功返回 None，否则返回失败原因（没有 ffprobe、代理不支持、超时等）。
+
+        - 带与下载相同的 UA、不带 Referer；-probesize 2MB、-rw_timeout 15 秒，整体 60 秒超时。
+        - 出口与 yt-dlp 自己的请求一致：用 --proxy / 环境变量 / 系统代理经 clean_proxies + select_proxy 选出的代理。
+          ffmpeg 只支持明文 http 代理，且只认小写的 http:// 前缀（大写或 https:// 会被它静默忽略而直连），
+          所以 http 代理统一改写成小写前缀；https / SOCKS 代理跳过 ffprobe。代理经环境变量 http_proxy 传入，
+          不放进命令行（ps 看得到）；yt-dlp 判定直连时去掉环境里的 http_proxy / no_proxy，免得 ffprobe 自己再选一次。
+        - 失败原因里不带代理地址，CDN 地址替换成 <url>。
+        """
+        from ..postprocessor.ffmpeg import FFmpegPostProcessor  # 延迟导入，避免 extractor 加载时牵出后处理模块
+
+        ffmpeg = FFmpegPostProcessor(self._downloader)
+        if not ffmpeg.probe_available:
+            return 'ffprobe not found; install ffmpeg or set --ffmpeg-location to fill in the codec info'
+        proxies = self._downloader.proxies.copy()
+        clean_proxies(proxies, HTTPHeaderDict())
+        proxy = select_proxy(url, proxies)
+        env = {key: value for key, value in os.environ.items() if key.lower() not in ('http_proxy', 'no_proxy')}
+        if proxy:
+            scheme, _, rest = proxy.partition('://')
+            if scheme.lower() != 'http':
+                return f'ffprobe only supports plain http proxies, not {scheme.lower()}'
+            env['http_proxy'] = f'http://{rest}'
+        cmd = [ffmpeg.probe_executable, '-v', 'error', '-rw_timeout', '15000000', '-probesize', '2000000',
+               '-user_agent', user_agent, '-print_format', 'json', '-show_format', '-show_streams', url]
+        self.to_screen(f'{video_id}: Probing Douyin original upload with ffprobe')
+        try:
+            stdout, stderr, returncode = Popen.run(
+                cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, env=env)
+        except Exception as e:  # 超时、无法启动等
+            return f'ffprobe failed: {type(e).__name__}'
+        if returncode:
+            error = (stderr or '').replace(url, '<url>').strip()
+            return f'ffprobe exited with code {returncode}: {error[-300:]}'
+        try:
+            info = ffprobe_info(json.loads(stdout))
+        except Exception as e:  # ffprobe 输出来自上传者可控的文件，畸形时按失败处理
+            return f'unable to read the ffprobe output: {type(e).__name__}'
+        if not info.get('vcodec'):
+            return 'ffprobe found no video stream'
+        original.update(info)
+        return None
 
     def _fetch_douyin_open_detail(self, video_id):
         """
