@@ -6,7 +6,8 @@
   同日跨项目调研 TikTok 下载方案（2.13）并接入第二渠道 `signed_web_api`（2.7.1）；2026-09-24 证实 TikTok 保存着上传原片、只有第三方拿得到（2.13.4）；
   2026-09-27 验证开源 App 签名不可行（2.13.8），并改写历史去掉提交说明里指向上游的编号（3.3）；
   2026-09-28 原片探测改为按容器补齐信息：支持 WebM / MKV，其他容器或解析失败时用 ffprobe 兜底（2.9）；
-  同日 chrome-150 伪装目标实测已解封，恢复与上游一致，并查清全局 `--impersonate` 改不了网页渠道的目标（2.7）
+  同日 chrome-150 伪装目标实测已解封，恢复与上游一致，并查清全局 `--impersonate` 改不了网页渠道的目标（2.7）；
+  同日复查上游 issue 9667 推荐的 jiji262/douyin-downloader，汇总 2026-09 Argus 的外部时间线与 `x-tt-argus` 说法（2.1、4、5 第 9–10 条）
 - 适用分支：`tiktok`
 - 对应代码：`yt_dlp/extractor/tiktok.py`（`DouyinIE`、`TikTokIE` 的两条渠道、`TikTokBaseIE._extract_web_formats`）、
   `yt_dlp/extractor/tiktok_utils/douyin/*`（抖音签名、Cookie、原片探测）、`yt_dlp/extractor/tiktok_utils/tiktok/*`（TikTok 签名接口）；
@@ -85,6 +86,13 @@ Python API 里每个值都要写成字符串列表，如 `{'douyin': {'original'
 拦不拦按客户端 IP 而定，不是「海外一律拦」：同一时间换 5 个巴西住宅 IP，3 个被拦（`Uifid Not Found`），
 另外 2 个上 web API 和不带签名的精简请求都正常返回；后续几轮分别为 6 个中 4 个、11 个中 4 个、14 个中 12 个、6 个中 5 个被拦
 （出口也有土耳其、叙利亚、美国节点）。按什么判断（IP 信誉、ASN、概率）未知；同一拦截 IP 几分钟的测试窗口内拦截状态没有变化。
+
+2026-09 的外部时间线（2026-09-28 汇总，来源见第 4 节 douyin-downloader、douyinie、f2 `x-tt-argus` 三行）：
+2026-08 Argus 先覆盖点赞、收藏、收藏夹等登录态列表接口；09-05～09-13 `aweme/detail`、`aweme/post` 对不带 `uifid` 的请求按概率拦截
+（上游 issue 9667 有人 09-07「重试 2–3 次能过」，media-parser#15 称 40–50%）；09-10 起 `mix/aweme`，09-14 起 `aweme/detail`、`aweme/post`、
+`mix/detail`、`mix/list`、`music/detail`、`music/aweme`、`music/list` 稳定拦截（jiji262/douyin-downloader `AGENTS.md` 的名单），
+上游 issue 9667 自 09-15 起持续 403（上游 `DouyinIE` 不签名）。同期本机（江苏移动）不签名请求一直直接 200（09-22 10/10，09-28 复测仍是），
+所以 09-14 不是全量拦截，仍符合「按客户端而定」；按 IP 还是按会话 / 设备指纹（dYm#28 的说法），外部报告互相矛盾，未定。
 
 **`x-secsdk-web-signature`（webSign）是纯算法，可以自己生成**：
 
@@ -916,8 +924,9 @@ for i in range(5):
 | DouYin_Spider | [cv-cat/DouYin_Spider](https://github.com/cv-cat/DouYin_Spider) `utils/secsdk_web_sign.py` | `x-secsdk-web-signature` 纯算实现的出处（2026-08-30），附逆向路径、规范化规则、受保护接口清单（`aweme/detail`、`aweme/post`、`aweme/favorite`、`mix/aweme`、`tab/feed` 等） | 实现 webSign，或它失效时 |
 | nous-app PR #2360 | [iocrazy/nous-app#2360](https://github.com/iocrazy/nous-app/pull/2360) | 实现 Argus webSign：`x-secsdk-web-signature`，Node 子进程跑 `websign_env.js` / `websign_runtime.js`，先 `a_bogus` 再 webSign，输入为带 `a_bogus` 的 URL、时间戳、`uifid`（实际上纯算即可，见 2.1 与 DouYin_Spider） | 纯算失效、需要跑真实 SDK 时 |
 | amagi PR #188 | [ikenxuan/amagi#188](https://github.com/ikenxuan/amagi/pull/188) | ① 免鉴权接口：`iesdouyin.com/web/api/v2/user/info/`（用户名转 `sec_uid`）、`/v2/music/info/`、`/v2/music/list/aweme/`、`api.amemv.com/aweme/v1/im/resources/emoji/`；② `webid` 与会话 Cookie 不匹配时服务端静默返回 200 空响应，改为读响应头 `cookie_ttwidinfo_webid` 按 `ttwid` 缓存；③ `x-secsdk-web-signature` 为 32 位小写 hex、放在 query 中，只对 SDK 策略表中的部分路径生效，必须是最后一步；④ Argus 拦截时重新生成 `msToken` / `verifyFp` / `a_bogus` 线性退避重试最多 5 次 | 扩展到用户主页、音乐等接口，或遇到莫名 200 空响应时 |
-| douyin-downloader | [jiji262/douyin-downloader](https://github.com/jiji262/douyin-downloader) | 说明 Argus 对非浏览器请求返回 `Uifid Not Found`，并称 webSign 只能在真实页面内生成（已被 DouYin_Spider 的纯算实现与我们的实测推翻）；主页批量翻页被拦时用 Playwright 启动真实浏览器滚动采集（默认有头，需手动过验证码） | 需要浏览器兜底方案时 |
-| douyinie Issue #125 | [monet88/douyinie#125](https://github.com/monet88/douyinie/issues/125) | 汇总：`aweme/detail`、`aweme/post` 被 Argus 确定性拦截，应视为风控而非瞬时错误、不要盲目重试；源头为 douyin-downloader 2026-09-14 的提交 `47f4eef` | 了解 Argus 覆盖范围时 |
+| douyin-downloader | [jiji262/douyin-downloader](https://github.com/jiji262/douyin-downloader) | 说明 Argus 对非浏览器请求返回 `Uifid Not Found`，并称 webSign 只能在真实页面内生成（已被 DouYin_Spider 的纯算实现与我们的实测推翻）；主页批量翻页被拦时用 Playwright 启动真实浏览器滚动采集（默认有头，需手动过验证码）。2026-09-28 复查（上游 issue 9667 当天有人推荐它解决 403）：命令行版的 README 自 09-14（提交 `fae033f`）起写明单视频 / 图文 / 合集 / 音乐被风控拦截、「更新 Cookie 或反复重试不能解决」，query 里 `uifid` 为空串、不做 webSign，没有新参数或新端点；能下的是闭源桌面版 Douzy，在 Electron 隐藏的登录窗口里由页面 SDK 补 `uifid` / `timestamp` / `x-secsdk-web-signature`，yt-dlp 无法复用，fork 的纯算 webSign 效果相同且不需登录。其注释里的反例 7508597705644985612（「原画 31.7M 小于超分档 47.4M」）经 fork 复测：`ratio=default` 返回的是 720p 转码档（与 `h264_720p_908531` 同为 31.72 MiB），fork 判为回退、不列原片；47.4 MiB 是普通的 1080p H.264 转码档，不是超分 | 需要浏览器兜底方案时 |
+| douyinie Issue #125 | [monet88/douyinie#125](https://github.com/monet88/douyinie/issues/125) | 汇总：`aweme/detail`、`aweme/post` 被 Argus 确定性拦截，应视为风控而非瞬时错误、不要盲目重试；源头为 douyin-downloader 2026-09-14 的提交 `fae033f`（「同步桌面版 Argus 门禁路由」；此前误写成 `47f4eef`，那是 09-17 的文件名修复，只是 douyinie 当时钉住的 HEAD） | 了解 Argus 覆盖范围时 |
+| f2 的 `x-tt-argus` | [Johnserf-Seed/f2#443](https://github.com/Johnserf-Seed/f2/issues/443)、f2 提交 `9b759fc`（2026-09-25） | 请求头加任意值的 `x-tt-argus`（有 UIFID Cookie 时另加 `uifid` 头），不做 webSign；f2 作者称网关只校验这个头是否存在（单方说法，没给数据）。MediaCrawler、PolyDL、content-hive 等相继采用，但都源自 #443 里 08-20 针对登录态列表接口的分析，不是独立验证；MediaCrawler、PolyDL 还要求 `verifyFp` / `fp` 等于浏览器 Cookie 的 `s_v_web_id`；#443 有服务器 IP 上改完仍失败的反例 | webSign 失效（出现 `Sign Invalid`）时；实测方案见第 5 节第 9 条 |
 | yt-dlp 上游 issue #4138 | [yt-dlp/yt-dlp#4138](https://github.com/yt-dlp/yt-dlp/issues/4138) | TikTok 原片取法的历史：2022-06 `/aweme/v1/play` 的 `ratio=default` 还能取原片，2022-08 起要求 `file_id`（2.7） | TikTok 原片有新方案时 |
 | yt-dlp 上游 #15690 | [yt-dlp/yt-dlp#15690](https://github.com/yt-dlp/yt-dlp/issues/15690) | TikTok 画质讨论，有人称带登录 Cookie 能稳定拿到 1080p（未说码率更高，未验证） | 测登录态 TikTok 画质时 |
 | yt-dlp 上游 PR #15710 | [yt-dlp/yt-dlp#15710](https://github.com/yt-dlp/yt-dlp/pull/15710) | TikTok 先带 `X-Forwarded-For` 美国地址，失败再去掉重试（未合并） | TikTok 只剩一档或缺 1080 档时 |
@@ -969,3 +978,10 @@ TikTok 方向 2026-09-23 跨项目调研新增的参考项目（yt-dlp 上游各
    - fork 自己生成 `verify_` 开头的 `s_v_web_id`，与 media-parser「普通作品带它会 403」的说法相反，需要 A/B；
    - 用户 `--cookies-from-browser` 带入的 `bd_ticket_guard*` 等字段是否影响 web API（media-parser 称会触发 `Signature Not Found`）。
 8. **`webid`**：目前两个 API 策略都不带 `webid`；将来若加上，注意 amagi 发现的「`webid` 与会话不匹配则 200 空响应」。
+9. **`x-tt-argus` 请求头（2026-09-28 记录，未实测）**：要在会被拦的出口上测（本机江苏移动不被拦，测不了；可用 Windows 电信机或住宅代理）。
+   对照组：① 不签名、不带 `uifid`，只加 `x-tt-argus: 1`；② 同 ① 再加 `uifid` 请求头（UIFID_TEMP）；③ 随机 `uifid` + 该头；
+   ④ fork 现有签名请求再加该头（确认无副作用）；①② 失败时再补 `verifyFp` = `fp` = Cookie `s_v_web_id` 的组，并换多个拦截 IP。
+   ① 成立才有收益（被拦 IP 上第一个视频省掉取精选页的请求）；无论结果如何都只作 webSign 之外的兜底，不替代它。
+10. **douyin-downloader 里的两个低优先级点（只读代码，未实测）**：付费作品以 `charge_info.is_charge_content` 识别，其 `download_addr` 据称是 CENC 加密的全长正片、
+   play 是试看版，fork 可给 `download_addr` 标 `has_drm` 并提示（README 推荐的选择器已排除 `download`，按推荐配置下不到密文）；
+   `video.is_need_set_cookie` 为真时原片地址加 `ss_is_p_v_ss=1`（对方只有 mock 测试，且它用的是 www.douyin.com 带签名的地址，fork 用 iesdouyin）。都要先找到真实样本。
