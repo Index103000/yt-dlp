@@ -2230,9 +2230,9 @@ class DouyinIE(TikTokBaseIE):
         """
         以 www.douyin.com 为来源、带 a_bogus 请求 aweme/detail；有 uifid 时一律加 x-secsdk-web-signature 签名。
 
-        uifid 依次取：cookiejar 里的 UIFID（浏览器）、UIFID_TEMP、yt-dlp 缓存。都没有时先发不签名的请求，
-        未被 Argus 拦截的网络上不多发请求；被拦截（Uifid Not Found）或 uifid 失效（Validate Error）时，
-        换下一个来源，都没有再从精选页取服务端下发的 UIFID_TEMP 重试。精选页响应留给 ssr_render_data 复用。
+        Prefer UIFID, UIFID_TEMP and the yt-dlp cache. If none is available, try the homepage's
+        x-tt-trace-host header before the unsigned request and jingxuan page. If that attempt fails,
+        resume the existing UIFID flow. Keep the jingxuan response available for ssr_render_data.
         """
         user_agent = DOUYIN_USER_AGENT
         # 只依赖访客 Cookie（实测只需 ttwid）；__ac_nonce / __ac_signature 只在取 UIFID_TEMP 的页面请求时需要
@@ -2243,6 +2243,19 @@ class DouyinIE(TikTokBaseIE):
         rejected = set()
         page_tried = False
         uifid, source = get_douyin_uifid(self)
+        if not uifid:
+            trace_uifid = self._obtain_douyin_trace_uifid(video_id)
+            if trace_uifid:
+                detail, reason = self._call_douyin_web_api(video_id, query, trace_uifid, 'x-tt-trace-host')
+                if detail:
+                    return detail, None
+                # Do not persist this candidate or clear real UIFID cookies when it fails.
+                # Only an explicit validation failure proves the candidate itself is invalid.
+                self.write_debug(f'Douyin x-tt-trace-host attempt failed ({reason}); resuming existing UIFID flow')
+                if 'Validate Error' in reason:
+                    rejected.add(trace_uifid)
+            # The homepage may also issue a real UIFID_TEMP; preserve the existing source priority.
+            uifid, source = get_douyin_uifid(self, exclude=rejected)
         # 每轮要么返回，要么把一个值加进 rejected；候选值（cookie UIFID / UIFID_TEMP、缓存）有限，页面最多取一次，必然终止
         while True:
             detail, reason = self._call_douyin_web_api(video_id, query, uifid, source)
@@ -2266,6 +2279,17 @@ class DouyinIE(TikTokBaseIE):
             source = 'webpage UIFID_TEMP'
             if not uifid:
                 return None, f'{reason}; unable to obtain a usable UIFID_TEMP from the webpage ({page_reason})'
+
+    def _obtain_douyin_trace_uifid(self, video_id):
+        """Get a temporary homepage header candidate without storing it in the cache or cookiejar."""
+        try:
+            _, urlh = self._download_webpage_handle(
+                self._WEBPAGE_HOST, video_id, 'Fetching Douyin home page for x-tt-trace-host',
+                headers={**DOUYIN_DEFAULT_WEB_HEADERS, 'User-Agent': DOUYIN_USER_AGENT})
+        except ExtractorError as e:
+            self.write_debug(f'Douyin x-tt-trace-host lookup failed ({e.orig_msg}); resuming existing UIFID flow')
+            return None
+        return (urlh.headers.get('x-tt-trace-host') or '').strip() or None
 
     def _call_douyin_web_api(self, video_id, query, uifid, uifid_source):
         if uifid:
